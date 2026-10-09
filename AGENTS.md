@@ -13,11 +13,13 @@ An OpenCode 2 plugin, published to npm as `opencode-smart-compaction`, that writ
 
 - Target the OpenCode 2 plugin API only (`{ id, setup }`); do not add a V1 `server()` entrypoint.
 - Import only types from `@opencode/plugin`. It stays a dev and optional peer dependency, never a runtime dependency.
-- The hook fails open: on any error or empty reply, leave `event.result` unset so OpenCode compacts with its own prompt.
-- `src/prompt.ts` and `src/git-state.ts` mirror the Pi extension (`shariq-pi-extensions/extensions/smart-compaction`). A change to the checkpoint format or protected-fact rules belongs in both.
+- The hook fails open: when every model attempt errors or returns a summary without all six sections, leave `event.result` unset so OpenCode compacts with its own prompt.
+- `src/prompt.ts` and `src/git-state.ts` mirror the Pi extension (`shariq-pi-extensions/extensions/smart-compaction`). A change to the checkpoint format or protected-fact rules belongs in both. Transcript serialization (`src/session.ts`) and the threshold (`src/threshold.ts`) are OpenCode-specific; the 600,000-token hard limit deliberately differs from Pi's 400,000.
+- `src/session.ts` parses text OpenCode generates (paths in the OpenCode repository): the checkpoint wrapper (`packages/core/src/session/runner/to-llm-message.ts`) and the recent-context lines (`messageToText` in `packages/core/src/session/compaction.ts`). Recheck both on every OpenCode upgrade; the full checklist is in `docs/DEVELOPMENT.md`.
+- The 95% threshold only works when OpenCode's `compaction.buffer` is below 5% of the window; keep the README's buffer guidance in step with any threshold change.
 - Prompt strings contain literal XML-style tags. Verify them with `grep` on the file, since some editing tools hide them in their display.
 - Test live against the published npm package, not a local path.
 
 ## Releases
 
-Bump `version` in `package.json` with every functional change; pushing it to `main` publishes through `.github/workflows/publish-npm.yml`. See `docs/DEVELOPMENT.md`.
+Bump `version` in `package.json` with every functional change; pushing it to `main` publishes through `.github/workflows/publish-npm.yml`. OpenCode does not install new versions of an unpinned plugin by itself: after the publish workflow succeeds, run `opencode plugin update`, confirm the version with `opencode api get /api/plugin`, and run the live test in `docs/DEVELOPMENT.md`.

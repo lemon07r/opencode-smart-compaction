@@ -11,11 +11,14 @@ The toolchain is pinned in `mise.toml`, Bun manages dependencies through `bun.lo
 
 ## Test against a live OpenCode
 
-Test the published package. With `"plugins": ["opencode-smart-compaction"]` in the config, confirm the plugin is active:
+Test the published package. After a release, pull it into OpenCode, which checks unpinned plugins for updates but never installs them on its own, then confirm the plugin is active at the new version:
 
 ```bash
+opencode plugin update
 opencode api get /api/plugin
 ```
+
+If `/api/plugin` still reports the old version, run `opencode service restart`.
 
 Compact a session that has at least two exchanges:
 
@@ -23,7 +26,9 @@ Compact a session that has at least two exchanges:
 opencode api post /api/session/<session-id>/compact --data '{}'
 ```
 
-Then read the session's messages (`opencode api get /api/session/<session-id>/message`). The completed `compaction` message should have the six numbered sections, any retained identifiers, and the file-state blocks at the end.
+Then read the session's messages (`opencode api get /api/session/<session-id>/message`). The completed `compaction` message should have the six numbered sections, any retained identifiers, and the file-state blocks at the end. Compact the same session again after another exchange: the read and touched file lists should still include files from before the first compaction, and the turns OpenCode kept verbatim the first time should be reflected in the new summary. With a background shell running (for example `sleep 600` started with the shell tool's `background` option), its command should appear in the background-process block.
+
+To check the threshold without filling a large window, set `"thresholdMode": "hard"` and a small `hardLimitTokens` (for example `20000`) in the plugin's options, send a few prompts, and confirm a `compaction` message appears once a step passes that size. Restore the real options afterward.
 
 ## Releases
 
@@ -34,5 +39,10 @@ Publishing uses npm trusted publishing (OIDC), so the repository holds no npm to
 ## Upgrading OpenCode
 
 1. Raise `@opencode/plugin` in `devDependencies` and the `peerDependencies` floor, then run `bun install`.
-2. Check `node_modules/@opencode/plugin/dist/promise/session.d.ts` for changes to the `compaction` hook event, and the OpenCode compaction source for changes to how the previous checkpoint is wrapped.
+2. Check for changes that the plugin depends on:
+   - `node_modules/@opencode/plugin/dist/promise/session.d.ts`: the `compaction` hook event and `generate.text` input.
+   - The OpenCode checkpoint wrapper in `packages/core/src/session/runner/to-llm-message.ts` and `messageToText` in `packages/core/src/session/compaction.ts`, which the plugin parses.
+   - `calculateCeiling` in `packages/core/src/session/compaction.ts`, which decides when OpenCode's own trigger fires relative to `compaction.buffer`.
+   - The events the plugin reads: `session.step.started`, `session.step.ended`, `session.compaction.*`, `session.deleted`, `shell.created`, `shell.exited`, `shell.deleted`, `model.updated`, and `provider.updated`; and the shell tool's `metadata.sessionID`.
+   - The built-in tool names and input fields in `packages/core/src/tool/plugin/` (`read`, `edit`, `write`, `patch`, `shell`).
 3. Run `validate`, publish, and repeat the live test above.

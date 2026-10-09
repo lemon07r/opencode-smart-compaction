@@ -13,20 +13,29 @@ const tag = (name: string, close = false) => `<${close ? "/" : ""}${name}>`;
 const CHECKPOINT_OPEN = tag("conversation-checkpoint");
 const SUMMARY_OPEN = tag("summary");
 const SUMMARY_CLOSE = tag("summary", true);
-
-/** Tool results longer than this are cut in the transcript, matching OpenCode's own compaction. */
-export const TOOL_OUTPUT_MAX_CHARS = 1_250;
+const RECENT_OPEN = `${SUMMARY_CLOSE}\n\n${tag("recent-context")}\n`;
+const RECENT_CLOSE = `\n${tag("recent-context", true)}`;
+// A user turn in OpenCode's serialized recent context runs until the next speaker label.
+const RECENT_USER_TURN =
+  /^\[User\]: ([\s\S]*?)(?=^\[(?:User|Assistant|Assistant reasoning|Assistant tool call|Tool result|Tool error|Shell|Synthetic context|Skill activated: [^\]\n]*|Attached [^\]\n]*)\]|(?![\s\S]))/gm;
 
 const READ_TOOLS = new Set(["read"]);
 const WRITE_TOOLS = new Set(["edit", "write"]);
 const PATCH_FILE_LINE = /^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm;
+const RECENT_TOOL_CALL = /^\[Assistant tool call\]: (read|edit|write|patch)\((.*)\)$/;
+
+// Transcript budgets, adapted from the Pi extension's serializer: long text keeps its beginning and end, failures
+// and the newest messages get more room, and large tool arguments are bounded.
+const RECENT_MESSAGES = 14;
+const LARGE_ARGUMENT_CHARS = 1_200;
+const LARGE_ARGUMENT_KEYS = /^(?:content|text|oldText|newText|oldString|newString|patch|patchText|input|data)$/i;
 
 export interface SessionFacts {
   userTexts: string[];
   previousSummary?: string;
   readFiles: string[];
   modifiedFiles: string[];
-  /** The conversation since the previous checkpoint, as text. */
+  /** The conversation since the previous summary, including its verbatim recent context, as text. */
   transcript: string;
 }
 
@@ -38,18 +47,101 @@ function textOf(message: Message): string {
     .join("\n");
 }
 
-/** The summary inside a previous checkpoint message, or undefined when the text is not one. */
-export function checkpointSummary(text: string): string | undefined {
-  if (!text.trimStart().startsWith(CHECKPOINT_OPEN)) return undefined;
-  const start = text.indexOf(SUMMARY_OPEN);
-  const end = text.lastIndexOf(SUMMARY_CLOSE);
-  if (start === -1 || end <= start) return undefined;
-  return text.slice(start + SUMMARY_OPEN.length, end).trim() || undefined;
+export interface PreviousCheckpoint {
+  summary?: string;
+  /** The conversation OpenCode kept verbatim beside the summary, already serialized as transcript text. */
+  recent?: string;
 }
 
-function truncate(value: string): string {
-  if (value.length <= TOOL_OUTPUT_MAX_CHARS) return value;
-  return `${Array.from(value).slice(0, TOOL_OUTPUT_MAX_CHARS).join("")}\n[truncated]`;
+/**
+ * The summary and verbatim recent context inside a previous checkpoint message, or undefined when the text is not
+ * one. The recent context covers turns that are no longer stored after the checkpoint, so it must be summarized too.
+ */
+export function parseCheckpoint(text: string): PreviousCheckpoint | undefined {
+  if (!text.trimStart().startsWith(CHECKPOINT_OPEN)) return undefined;
+  const start = text.indexOf(SUMMARY_OPEN);
+  if (start === -1) return undefined;
+  const recentStart = text.indexOf(RECENT_OPEN, start);
+  const recentEnd = text.lastIndexOf(RECENT_CLOSE);
+  const end = recentStart === -1 ? text.lastIndexOf(SUMMARY_CLOSE) : recentStart;
+  if (end <= start) return undefined;
+  const summary = text.slice(start + SUMMARY_OPEN.length, end).trim() || undefined;
+  const recent =
+    recentStart !== -1 && recentEnd > recentStart
+      ? text.slice(recentStart + RECENT_OPEN.length, recentEnd).trim() || undefined
+      : undefined;
+  return { summary, recent };
+}
+
+function recentUserTexts(recent: string): string[] {
+  return [...recent.matchAll(RECENT_USER_TURN)].map((match) => match[1]!.trim()).filter(Boolean);
+}
+
+function lineSafeHead(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const boundary = text.lastIndexOf("\n", limit);
+  return text.slice(0, boundary > 0 ? boundary : limit);
+}
+
+function lineSafeTail(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const start = text.length - limit;
+  const boundary = text.indexOf("\n", start);
+  return text.slice(boundary >= 0 && boundary < text.length - 1 ? boundary + 1 : start);
+}
+
+/** Keeps the beginning and end of long text, where commands and their errors usually are. */
+export function truncateHeadAndTail(text: string, headChars: number, tailChars: number): string {
+  if (text.length <= headChars + tailChars) return text;
+  const head = lineSafeHead(text, headChars);
+  const tail = lineSafeTail(text, tailChars);
+  const omitted = text.length - head.length - tail.length;
+  return `${head}\n\n[... ${omitted} characters omitted; showing beginning and end of output ...]\n\n${tail}`;
+}
+
+/** Strips terminal escape sequences and carriage-return redraws, and collapses repeated lines. */
+export function cleanTerminalOutput(text: string): string {
+  const withoutAnsi = text
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  const lines: string[] = [];
+  let repeated = 0;
+  const flush = () => {
+    if (repeated > 0) lines.push(`[previous line repeated ${repeated} more time${repeated === 1 ? "" : "s"}]`);
+    repeated = 0;
+  };
+  for (const rawLine of withoutAnsi.split("\n")) {
+    const segments = rawLine.split("\r");
+    const line = segments.at(-1) || [...segments].reverse().find(Boolean) || "";
+    if (lines.length > 0 && line && lines.at(-1) === line) {
+      repeated++;
+      continue;
+    }
+    flush();
+    lines.push(line);
+  }
+  flush();
+  return lines.join("\n");
+}
+
+function formatToolInput(input: unknown): string {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return truncateHeadAndTail(JSON.stringify(input) ?? "", 2_000, 2_000);
+  }
+  return Object.entries(input)
+    .map(([key, value]) => {
+      const serialized = JSON.stringify(value) ?? "undefined";
+      const half = LARGE_ARGUMENT_KEYS.test(key) ? LARGE_ARGUMENT_CHARS / 2 : 2_000;
+      return `${key}=${truncateHeadAndTail(serialized, half, half)}`;
+    })
+    .join(", ");
+}
+
+function toolResultBudget(tool: string, isError: boolean, isRecent: boolean): number {
+  if (isError) return isRecent ? 2_500 : 1_500;
+  if (["write", "edit", "patch", "shell"].includes(tool)) return isRecent ? 1_200 : 700;
+  if (["read", "grep", "glob"].includes(tool)) return isRecent ? 1_000 : 400;
+  return isRecent ? 1_500 : 500;
 }
 
 function resultText(part: Extract<Part, { type: "tool-result" }>): string {
@@ -62,7 +154,7 @@ function resultText(part: Extract<Part, { type: "tool-result" }>): string {
   return typeof result.value === "string" ? result.value : (JSON.stringify(result.value) ?? "");
 }
 
-function flatten(message: Message): string {
+function flatten(message: Message, isRecent: boolean): string {
   if (message.role === "system") return "";
   const speaker = message.role === "user" ? "User" : "Assistant";
   return message.content
@@ -70,12 +162,20 @@ function flatten(message: Message): string {
       switch (part.type) {
         case "text":
           return part.text ? [`[${speaker}]: ${part.text}`] : [];
+        case "reasoning": {
+          const budget = isRecent ? 800 : 400;
+          return part.text.trim() ? [`[Assistant reasoning]: ${truncateHeadAndTail(part.text.trim(), budget, budget)}`] : [];
+        }
         case "media":
           return [`[${part.media.mediaType} omitted]`];
         case "tool-call":
-          return [`[Assistant tool call]: ${part.name}(${JSON.stringify(part.input) ?? ""})`];
-        case "tool-result":
-          return [`[${part.result.type === "error" ? "Tool error" : "Tool result"}]: ${truncate(resultText(part))}`];
+          return [`[Assistant tool call]: ${part.name}(${formatToolInput(part.input)})`];
+        case "tool-result": {
+          const isError = part.result.type === "error";
+          const text = part.name === "shell" ? cleanTerminalOutput(resultText(part)) : resultText(part);
+          const budget = toolResultBudget(part.name, isError, isRecent);
+          return [`[${isError ? "Tool error" : "Tool result"}: ${part.name}]: ${truncateHeadAndTail(text, budget, budget)}`];
+        }
         default:
           return [];
       }
@@ -89,35 +189,68 @@ function stringField(input: unknown, key: string): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+const unescapeXml = (text: string) =>
+  text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+
+/** A file list the plugin appended to a previous checkpoint, so file activity accumulates across compactions. */
+function appendedFileList(summary: string | undefined, name: string): string[] {
+  const block = summary?.match(new RegExp(`\\n${tag(name)}\\n([\\s\\S]*?)\\n${tag(name, true)}`))?.[1];
+  return block ? block.split("\n").map(unescapeXml).filter(Boolean) : [];
+}
+
+/** Successful file tool calls in OpenCode's serialized recent context. */
+function recentToolCalls(recent: string): Array<{ name: string; input: unknown }> {
+  const lines = recent.split("\n");
+  return lines.flatMap((line, index) => {
+    const match = line.match(RECENT_TOOL_CALL);
+    if (!match || lines[index + 1]?.startsWith("[Tool error]")) return [];
+    try {
+      return [{ name: match[1]!, input: JSON.parse(match[2]!) as unknown }];
+    } catch {
+      return [];
+    }
+  });
+}
+
 export function readSessionFacts(messages: readonly Message[]): SessionFacts {
   const userTexts: string[] = [];
   const lines: string[] = [];
   const failed = new Set<string>();
-  const calls: Array<Extract<Part, { type: "tool-call" }>> = [];
+  const calls: Array<{ id?: string; name: string; input: unknown }> = [];
   let previousSummary: string | undefined;
 
-  for (const message of messages) {
+  for (const [index, message] of messages.entries()) {
     for (const part of message.content) {
       if (part.type === "tool-result" && part.result.type === "error") failed.add(part.id);
       if (part.type === "tool-call") calls.push(part);
     }
     if (message.role === "user") {
       const text = textOf(message);
-      const summary = checkpointSummary(text);
-      if (summary !== undefined) {
-        previousSummary = summary;
+      const checkpoint = parseCheckpoint(text);
+      if (checkpoint !== undefined) {
+        previousSummary = checkpoint.summary ?? previousSummary;
+        if (checkpoint.recent) {
+          userTexts.push(...recentUserTexts(checkpoint.recent));
+          calls.push(...recentToolCalls(checkpoint.recent));
+          lines.push(checkpoint.recent);
+        }
         continue;
       }
       if (text) userTexts.push(text);
     }
-    const line = flatten(message);
+    const line = flatten(message, messages.length - index <= RECENT_MESSAGES);
     if (line) lines.push(line);
   }
 
-  const read = new Set<string>();
-  const modified = new Set<string>();
+  const read = new Set(appendedFileList(previousSummary, "read-files"));
+  const modified = new Set(appendedFileList(previousSummary, "touched-files"));
   for (const call of calls) {
-    if (failed.has(call.id)) continue;
+    if (call.id !== undefined && failed.has(call.id)) continue;
     if (READ_TOOLS.has(call.name)) {
       const file = stringField(call.input, "path");
       if (file) read.add(file);

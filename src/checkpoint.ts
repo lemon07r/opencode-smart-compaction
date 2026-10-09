@@ -21,6 +21,20 @@ import type { SessionFacts } from "./session.ts";
 
 export const RETAINED_IDENTIFIERS_HEADING = "### Retained Identifiers";
 
+const REQUIRED_SECTIONS = [
+  /## 1\.\s+Primary Goal/i,
+  /## 2\.\s+Progress Ledger/i,
+  /## 3\.\s+Code Changes/i,
+  /## 4\.\s+Errors/i,
+  /## 5\.\s+Key Decisions/i,
+  /## 6\.\s+Resume Anchor/i,
+];
+
+/** Whether a summary has all six numbered sections; a reply cut off by an output limit usually does not. */
+export function isCompleteSummary(text: string): boolean {
+  return REQUIRED_SECTIONS.every((section) => section.test(text));
+}
+
 const CONVERSATION_OPEN = "<conversation>";
 const CONVERSATION_CLOSE = "</conversation>";
 
@@ -38,7 +52,7 @@ export interface Checkpoint {
   appendix: string;
 }
 
-export function buildCheckpoint(facts: SessionFacts, git: GitEngineeringState): Checkpoint {
+export function buildCheckpoint(facts: SessionFacts, git: GitEngineeringState, backgroundProcesses: string[] = []): Checkpoint {
   const previousSummary = facts.previousSummary ? semanticSummary(facts.previousSummary) : undefined;
   const protectedFacts = extractProtectedFacts(facts.userTexts, previousSummary);
 
@@ -61,6 +75,7 @@ export function buildCheckpoint(facts: SessionFacts, git: GitEngineeringState): 
     dirtyPatch: git.patch,
     dirtyStateAvailable: git.available,
     lockfilesAndGeneratedAssets: git.lockfilesAndGeneratedAssets,
+    activeBackgroundProcesses: backgroundProcesses,
   });
 
   return { prompt: sections.join("\n\n"), protectedFacts, appendix };

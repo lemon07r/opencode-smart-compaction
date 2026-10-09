@@ -18,9 +18,13 @@ The model writes six sections:
 The plugin then adds two things the model doesn't write:
 
 - **Retained identifiers.** Commit SHAs, UUIDs, URLs, and IPv4 addresses from your messages or the previous checkpoint are protected. Any the summary dropped are appended verbatim under `### Retained Identifiers`.
-- **File and worktree state.** Files the session read or changed through tools, the files git reports as dirty, lockfile and generated-asset changes, and a bounded diff of uncommitted work, including previews of untracked files. Untracked symlinks are never followed.
+- **File and worktree state.** Files the session read or changed through tools, accumulated across compactions; the files git reports as dirty; lockfile and generated-asset changes; background shells the session still has running, so the next turn doesn't start a duplicate dev server; and a bounded diff of uncommitted work, including previews of untracked files. Untracked symlinks are never followed.
 
-On the next compaction, the previous checkpoint goes back to the model as `<previous-summary>` and is merged with the new turns. The appended state is regenerated each time.
+The conversation goes to the model in a bounded form: long tool output keeps its beginning and end, failures and the newest messages get more room, large tool arguments such as file contents are shortened, and terminal escape codes and repeated lines are removed. Session history itself is never changed.
+
+A summary is accepted only when it has all six sections. Otherwise the plugin retries the same model with its default settings (no variant), then the session's model when compaction uses a different one. Authentication, permission, and quota errors stop the retries.
+
+On the next compaction, the previous checkpoint goes back to the model as `<previous-summary>` and is merged with the new turns, including the recent conversation OpenCode kept verbatim beside it. The appended state is regenerated each time.
 
 OpenCode still keeps the most recent conversation (`compaction.keep.tokens`) verbatim beside the checkpoint.
 
@@ -35,21 +39,39 @@ Add the package to `plugins` in `~/.config/opencode/opencode.json` or a project'
 }
 ```
 
-OpenCode installs it from npm on the next start. It needs OpenCode 2.0.26 or later.
+OpenCode installs it from npm on the next start. It needs OpenCode 2.0.26 or later. OpenCode checks unpinned plugins for new versions but doesn't install them on its own; run `opencode plugin update` to upgrade.
 
 ## Configure
 
-The plugin has no options. Compaction itself is configured in OpenCode:
+Compaction triggers at whichever comes first: 95% of the model's context window or 600,000 tokens. After each model step, the plugin compares the context that step used with that threshold and, once it is reached, requests a compaction, which OpenCode runs before the next step. Change it with plugin options:
 
-- `compaction.auto` (default `true`) and `compaction.buffer` decide when automatic compaction runs; `/compact` runs it on demand.
+```json
+{
+  "plugins": [
+    {
+      "package": "opencode-smart-compaction",
+      "options": { "thresholdMode": "hybrid", "thresholdPercent": 95, "hardLimitTokens": 600000 }
+    }
+  ]
+}
+```
+
+- `thresholdMode`: `hybrid` (default, whichever comes first), `percent`, `hard`, or `off` to leave timing to OpenCode alone.
+- `thresholdPercent` (default `95`) and `hardLimitTokens` (default `600000`).
+
+OpenCode's own automatic compaction still runs at the model window minus `compaction.buffer` (10% of the window by default), and it fires first when that is lower than the plugin's threshold. For the 95% threshold to apply, set `compaction.buffer` below 5% of your smallest model window; `8000` works for windows of 200,000 tokens and up. OpenCode's own trigger then remains a backstop. Other compaction settings:
+
+- `compaction.auto` (default `true`) turns OpenCode's automatic compaction and overflow recovery on or off; `/compact` runs it on demand.
 - `compaction.keep.tokens` (default `15000`) sets how much recent conversation stays verbatim beside the checkpoint.
 
-The checkpoint is written by the session's model. Models set to provider-native compaction (`settings.compaction.type: "native"`) don't call the hook, so the plugin doesn't apply to them.
+The checkpoint is written by the session's model with its selected variant, so reasoning settings carry over. To use another model, set `agents.compaction.model` (for example `"provider/model#variant"`); OpenCode passes that model to the plugin instead. Models set to provider-native compaction (`settings.compaction.type: "native"`) don't call the hook, so the checkpoint format doesn't apply to them; the threshold still does.
 
 ## Limits
 
-- **No validation retry.** A summary that comes back incomplete is kept as written. Pi's Smart Compaction can reject it and retry on another model.
-- **Fails open.** If the plugin can't build or generate a checkpoint, it logs a warning and OpenCode compacts with its own prompt. A session never blocks on the plugin.
+- **Fails open.** If no attempt produces a complete checkpoint, the plugin logs a warning and OpenCode compacts with its own prompt. A session never blocks on the plugin. Pi's Smart Compaction cancels compaction instead.
+- **No timeout or thinking-off retry.** OpenCode's generation API takes only a prompt and a model, so an attempt can't be cancelled after a time limit and the retry uses the model's default settings rather than turning reasoning off.
+- **Compaction cost isn't recorded.** The same API returns no token usage, so the summary request doesn't appear in OpenCode's session cost.
+- **Background shells after a restart.** Running shells are learned from OpenCode's events, so shells started before the OpenCode service last restarted aren't listed.
 
 ## Documentation
 
