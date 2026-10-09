@@ -1,0 +1,58 @@
+{
+  "name": "opencode-smart-compaction",
+  "version": "0.1.0",
+  "description": "Smart Compaction for OpenCode: structured six-section checkpoints with protected identifiers and exact file and worktree state.",
+  "license": "MIT",
+  "author": "Shariq Riaz",
+  "type": "module",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "compaction",
+    "context",
+    "summary"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shariqriazz/opencode-smart-compaction.git"
+  },
+  "homepage": "https://github.com/shariqriazz/opencode-smart-compaction#readme",
+  "bugs": {
+    "url": "https://github.com/shariqriazz/opencode-smart-compaction/issues"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/*.test.ts",
+    "validate": "bun run check && bun run test",
+    "pack:inspect": "npm pack --dry-run --ignore-scripts"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.35",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}
