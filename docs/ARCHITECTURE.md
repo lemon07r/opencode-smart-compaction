@@ -30,6 +30,8 @@ With `maxRecentTokens > 0` (default 40,000), the compaction hook uses request me
 
 The `context` hook shortens only a marked checkpoint's recent block. It estimates tokens as characters divided by four, keeps the newest portion at a turn boundary when possible, and adds an omission note. Copies preserve message and part prototypes; stored messages remain unchanged. The cut depends only on the text and budget, so repeated requests have the same prefix. On the next compaction, a marked checkpoint's recent text is still read for protected user facts and file activity but isn't added to the semantic transcript again. Unmarked checkpoints keep the old behavior. `maxRecentTokens: 0` disables both extra kept-turn coverage and trimming.
 
+Manual compaction places an empty running-compaction record in the stored context before the hook runs. That placeholder and idle records have no conversation to cover. Earlier failed compactions contribute a labeled, bounded error; completed checkpoints inside the kept tail remain unsupported rather than silently losing their summaries.
+
 ### Events
 
 `subscribe` (`src/events.ts`) runs one loop over `ctx.event.subscribe` and feeds each event to two handlers; the setup's returned cleanup aborts it.

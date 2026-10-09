@@ -582,7 +582,6 @@ test("unsupported stored content and attachments withhold the kept-tail marker",
   const unsupported = [
     { type: "compaction", status: "completed", summary: "other checkpoint", recent: "unknown recent content" },
     { type: "compaction", status: "running", summary: "unfinished", recent: "unknown recent content" },
-    { type: "compaction", status: "failed", error: { message: "failed" } },
     { type: "agent-switched", agent: "worker" },
     { type: "model-switched", model: { providerID: "p", id: "m" } },
     { type: "location-switched", directory: "/other" },
@@ -619,6 +618,33 @@ test("unsupported stored content and attachments withhold the kept-tail marker",
     assert.equal(contextEvent.messages[0], original, "unsupported tails are left whole");
   }
   assert.ok(canSummarizeKept([]), "an empty matched tail has no unsupported content");
+});
+
+test("compaction lifecycle records do not prevent safe coverage of the kept conversation", async () => {
+  const tail = [
+    { id: "failed", type: "compaction", status: "failed", reason: "manual", error: { type: "compaction.failed", message: "No older conversation to summarize" } },
+    { id: "kept", type: "user", text: "Keep working on the release" },
+    { id: "pending", type: "compaction", status: "running", reason: "manual", summary: "", recent: "" },
+  ];
+  assert.ok(canSummarizeKept(tail as never));
+  const facts = readSessionFacts(asTranscriptMessages(tail as never));
+  assert.deepEqual(facts.userTexts, ["Keep working on the release"]);
+  assert.match(facts.transcript, /Historical compaction failure.*No older conversation to summarize/);
+  assert.doesNotMatch(facts.transcript, /pending|running/, "the current empty placeholder is not a task to resume");
+  assert.equal(canSummarizeKept([{ ...tail[2], summary: "uncovered summary" }] as never), false);
+  assert.equal(canSummarizeKept([{ ...tail[2], recent: "uncovered recent turns" }] as never), false);
+
+  let prompt = "";
+  const hooks = await loadHooks(async (input) => {
+    prompt = input.prompt;
+    return { text: SIX_SECTIONS };
+  }, [], [{ id: "boundary", type: "user", text: "start" }, ...tail]);
+  const event = compactionEvent();
+  event.messages = [withID("boundary", user("start"))] as never;
+  await hooks.get("compaction")!(event);
+  assert.ok(prompt.includes("No older conversation to summarize"));
+  assert.ok(prompt.includes("[User]: Keep working on the release"));
+  assert.ok(summarizesRecent(event.result?.summary));
 });
 
 test("a context-read failure retains carried subagents and never marks or trims the kept tail", async () => {

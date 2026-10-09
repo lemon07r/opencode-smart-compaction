@@ -9,7 +9,7 @@
  */
 
 import type { SessionCompaction } from "@opencode/plugin/promise/session";
-import { CHECKPOINT_OPEN, parseCheckpoint, RECENT_CLOSE, RECENT_OPEN, summarizesRecent } from "./session.ts";
+import { CHECKPOINT_OPEN, parseCheckpoint, RECENT_CLOSE, RECENT_OPEN, summarizesRecent, truncateHeadAndTail } from "./session.ts";
 import type { ContextMessage } from "./subagents.ts";
 
 type Message = SessionCompaction["messages"][number];
@@ -62,6 +62,10 @@ export function canSummarizeKept(stored: readonly ContextMessage[]): boolean {
       case "synthetic":
       case "idle":
         return true;
+      case "compaction":
+        // Manual compaction stores its empty running placeholder before invoking the hook. It isn't conversation.
+        // Failed earlier attempts carry an error that the adapter includes; completed checkpoints still need a boundary.
+        return message.status === "failed" || (message.status === "running" && !message.summary.trim() && !message.recent.trim());
       case "user":
         return !message.files?.length && !message.agents?.length && !message.skills?.length;
       case "assistant":
@@ -99,6 +103,10 @@ export function asTranscriptMessages(stored: readonly ContextMessage[]): Message
         return [text("assistant", `[Historical skill context: ${message.name} (${message.skill})]: ${message.text}`)];
       case "system":
         return message.text.trim() ? [text("assistant", `[Historical system context]: ${message.text}`)] : [];
+      case "compaction":
+        return message.status === "failed"
+          ? [text("assistant", `[Historical compaction failure]: ${message.error.type}: ${truncateHeadAndTail(message.error.message, 1_500, 1_500)}`)]
+          : [];
       case "shell":
         return [
           {
