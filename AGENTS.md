@@ -22,4 +22,4 @@ An OpenCode 2 plugin, published to npm as `opencode-smart-compaction`, that writ
 
 ## Releases
 
-Bump `version` in `package.json` with every functional change; pushing it to `main` publishes through `.github/workflows/publish-npm.yml`. OpenCode does not install new versions of an unpinned plugin by itself: after the publish workflow succeeds, run `opencode plugin update`, confirm the version with `opencode api get /api/plugin`, and run the live test in `docs/DEVELOPMENT.md`.
+Bump `version` in `package.json` with every functional change; pushing it to `main` publishes through `.github/workflows/publish-npm.yml`. OpenCode does not install new versions of an unpinned plugin by itself: after the publish workflow succeeds, run `opencode plugin update`, then `opencode service restart` so the host's `opencode.service` loads the new version, confirm the version with `opencode api get /api/plugin`, and run the live test in `docs/DEVELOPMENT.md`. The user has given standing approval for this update and restart after every release; do not ask first. The binary is at `~/.opencode/bin/opencode`, which may not be on `PATH`.
