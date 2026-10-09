@@ -75,6 +75,20 @@ test("session facts keep user words, the previous checkpoint, files touched by t
   assert.ok(!facts.transcript.includes("latest checkpoint"), "the previous checkpoint is carried separately");
 });
 
+test("carried-over file lists keep only the most recently used paths", () => {
+  const oldReads = Array.from({ length: 50 }, (_, i) => `/repo/old-${String(i).padStart(2, "0")}.ts`);
+  const previous = `latest checkpoint\n\n${open("read-files")}\n${oldReads.join("\n")}\n${close("read-files")}`;
+  const facts = readSessionFacts([
+    checkpointMessage(previous),
+    call("1", "read", { path: "/repo/new.ts" }),
+    call("2", "read", { path: "/repo/old-00.ts" }),
+  ] as unknown as Messages);
+  assert.equal(facts.readFiles.length, 40);
+  assert.ok(facts.readFiles.includes("/repo/new.ts"), "a newly read file is kept");
+  assert.ok(facts.readFiles.includes("/repo/old-00.ts"), "re-reading a file makes it recent again");
+  assert.ok(!facts.readFiles.includes("/repo/old-01.ts"), "the oldest carried-over paths are dropped");
+});
+
 test("the prompt carries the conversation, previous checkpoint, and protected facts, without regenerated state", () => {
   const previous = `## 1. Primary Goal & Nuanced Intent\n- keep ${SHA}\n\n${open(TOUCHED)}\nold.ts\n${close(TOUCHED)}`;
   const checkpoint = buildCheckpoint(

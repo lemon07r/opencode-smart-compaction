@@ -29,6 +29,19 @@ const RECENT_TOOL_CALL = /^\[Assistant tool call\]: (read|edit|write|patch)\((.*
 const RECENT_MESSAGES = 14;
 const LARGE_ARGUMENT_CHARS = 1_200;
 const LARGE_ARGUMENT_KEYS = /^(?:content|text|oldText|newText|oldString|newString|patch|patchText|input|data)$/i;
+// The appended file lists carry over across compactions; keep only the most recently used paths so they stay bounded.
+const MAX_READ_FILES = 40;
+const MAX_MODIFIED_FILES = 60;
+
+/** Moves a path to the most-recent end of an insertion-ordered set. */
+function touchPath(paths: Set<string>, file: string): void {
+  paths.delete(file);
+  paths.add(file);
+}
+
+function newestPaths(paths: Iterable<string>, limit: number): string[] {
+  return [...paths].slice(-limit).sort();
+}
 
 export interface SessionFacts {
   userTexts: string[];
@@ -253,14 +266,14 @@ export function readSessionFacts(messages: readonly Message[]): SessionFacts {
     if (call.id !== undefined && failed.has(call.id)) continue;
     if (READ_TOOLS.has(call.name)) {
       const file = stringField(call.input, "path");
-      if (file) read.add(file);
+      if (file) touchPath(read, file);
     } else if (WRITE_TOOLS.has(call.name)) {
       const file = stringField(call.input, "path");
-      if (file) modified.add(file);
+      if (file) touchPath(modified, file);
     } else if (call.name === "patch") {
       for (const match of (stringField(call.input, "patchText") ?? "").matchAll(PATCH_FILE_LINE)) {
         const file = (match[1] ?? match[2])?.trim();
-        if (file) modified.add(file);
+        if (file) touchPath(modified, file);
       }
     }
   }
@@ -268,8 +281,8 @@ export function readSessionFacts(messages: readonly Message[]): SessionFacts {
   return {
     userTexts,
     previousSummary,
-    readFiles: [...read].filter((file) => !modified.has(file)).sort(),
-    modifiedFiles: [...modified].sort(),
+    readFiles: newestPaths([...read].filter((file) => !modified.has(file)), MAX_READ_FILES),
+    modifiedFiles: newestPaths(modified, MAX_MODIFIED_FILES),
     transcript: lines.join("\n\n"),
   };
 }
