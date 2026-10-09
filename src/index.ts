@@ -4,10 +4,22 @@ import { subscribe } from "./events.ts";
 import { getGitEngineeringState } from "./git-state.ts";
 import { readSessionFacts } from "./session.ts";
 import { createShellTracker } from "./shells.ts";
+import { carriedSubagents, formatSubagent, runningSubagents } from "./subagents.ts";
 import { createThresholdWatcher, readThresholdConfig } from "./threshold.ts";
 
 const PLUGIN_ID = "opencode-smart-compaction";
 const warn = (message: string) => console.warn(`[${PLUGIN_ID}] ${message}`);
+
+/** The session's background subagents that have not reported back, or none when its context can't be read. */
+async function readRunningSubagents(ctx: Pick<Plugin.Context, "session">, sessionID: string, previousSummary?: string) {
+  try {
+    const messages = await ctx.session.context({ sessionID });
+    return runningSubagents(messages, carriedSubagents(previousSummary)).map(formatSubagent);
+  } catch (error) {
+    warn(`running subagents unavailable: ${String(error)}`);
+    return [];
+  }
+}
 
 type ModelRef = NonNullable<Parameters<Plugin.Context["generate"]["text"]>[0]["model"]>;
 
@@ -41,7 +53,8 @@ export function isFatalGenerationError(error: unknown): boolean {
  * has all six sections, completes it, and returns it as the hook result so
  * OpenCode skips its own summary request. If no attempt yields a complete
  * summary, the result stays unset and OpenCode compacts with its built-in
- * prompt. An event watcher adds the hybrid threshold and tracks running shells.
+ * prompt. An event watcher adds the hybrid threshold and tracks running shells;
+ * background subagents that have not reported back are read from the session's context.
  */
 export default {
   id: PLUGIN_ID,
@@ -55,7 +68,8 @@ export default {
         if (!facts.transcript.trim()) return;
         const session = await ctx.session.get({ sessionID: event.sessionID });
         const git = await getGitEngineeringState(session.location.directory || ctx.location.directory);
-        const checkpoint = buildCheckpoint(facts, git, shells.running(event.sessionID));
+        const subagents = await readRunningSubagents(ctx, event.sessionID, facts.previousSummary);
+        const checkpoint = buildCheckpoint(facts, git, shells.running(event.sessionID), subagents);
         let problem = "no attempt was made";
         for (const model of summaryModels(event.model, session.model)) {
           try {

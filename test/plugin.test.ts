@@ -7,6 +7,8 @@ import test from "node:test";
 import { buildCheckpoint, completeSummary, RETAINED_IDENTIFIERS_HEADING, semanticSummary } from "../src/checkpoint.ts";
 import { getGitEngineeringState } from "../src/git-state.ts";
 import { readSessionFacts } from "../src/session.ts";
+import { formatFileOperationsXml } from "../src/prompt.ts";
+import { carriedSubagents, formatSubagent, runningSubagents } from "../src/subagents.ts";
 import plugin from "../src/index.ts";
 
 const SHA = "1234567890abcdef1234567890abcdef12345678";
@@ -63,7 +65,11 @@ test("session facts keep user words, the previous checkpoint, files touched by t
   assert.deepEqual(facts.userTexts, ["Keep 10.0.0.9 reachable", `Deploy ${SHA} to https://example.com/api`]);
   assert.ok(facts.previousSummary?.startsWith("latest checkpoint"));
   assert.deepEqual(facts.readFiles, ["/repo/old-read.ts", "/repo/src/a.ts"], "read files accumulate across compactions");
-  assert.deepEqual(facts.modifiedFiles, ["/repo/old & edited.ts", "/repo/recent.ts", "/repo/src/b.ts", "src/moved.ts", "src/new.ts", "src/old.ts"]);
+  assert.deepEqual(
+    facts.modifiedFiles,
+    ["/repo/old & edited.ts", "/repo/recent.ts", "/repo/src/b.ts", "src/new.ts", "src/old.ts", "src/moved.ts"],
+    "changed files are listed in the order they were last used",
+  );
   assert.ok(facts.transcript.startsWith("[User]: Keep 10.0.0.9 reachable\n"), "the verbatim recent context is summarized first");
   assert.match(facts.transcript, /\[User\]: Deploy/);
   assert.match(facts.transcript, /\[Assistant tool call\]: read\(path="\/repo\/src\/a\.ts"\)/);
@@ -87,6 +93,25 @@ test("carried-over file lists keep only the most recently used paths", () => {
   assert.ok(facts.readFiles.includes("/repo/new.ts"), "a newly read file is kept");
   assert.ok(facts.readFiles.includes("/repo/old-00.ts"), "re-reading a file makes it recent again");
   assert.ok(!facts.readFiles.includes("/repo/old-01.ts"), "the oldest carried-over paths are dropped");
+
+  // A second compaction evicts by recency, not by name: old-00.ts was used last before it, so it outlives new.ts.
+  const appendix = buildCheckpoint(facts, noGit).appendix;
+  const next = readSessionFacts([
+    checkpointMessage(`latest checkpoint${appendix}`),
+    ...Array.from({ length: 39 }, (_, i) => call(`n${i}`, "read", { path: `/repo/a-${String(i).padStart(2, "0")}.ts` })),
+  ] as unknown as Messages);
+  assert.deepEqual(next.readFiles.slice(0, 1), ["/repo/old-00.ts"], "the most recently used carried path survives");
+  assert.ok(!next.readFiles.includes("/repo/new.ts"), "an older path is evicted even though it sorts first");
+
+  const touched = readSessionFacts([
+    call("r", "read", { path: "/repo/kept-read.ts" }),
+    call("e", "edit", { path: "/repo/kept-read.ts" }),
+    ...Array.from({ length: 60 }, (_, i) => call(`w${i}`, "write", { path: `/repo/w-${i}.ts` })),
+    call("r2", "read", { path: "/repo/kept-read.ts" }),
+  ] as unknown as Messages);
+  assert.equal(touched.modifiedFiles.length, 60);
+  assert.ok(!touched.modifiedFiles.includes("/repo/kept-read.ts"));
+  assert.ok(touched.readFiles.includes("/repo/kept-read.ts"), "a file evicted from the changed list still shows as read");
 });
 
 test("the prompt carries the conversation, previous checkpoint, and protected facts, without regenerated state", () => {
@@ -151,6 +176,55 @@ test("git state covers tracked diffs and bounded untracked previews, never follo
   assert.equal((await getGitEngineeringState(os.tmpdir())).available, false);
 });
 
+const launch = (sessionID: string, agent: string, description: string, status = "running") => ({
+  type: "assistant",
+  content: [
+    {
+      type: "tool",
+      name: "subagent",
+      state: { status: "completed", input: { agent, description, prompt: "..." }, content: [{ type: "text", text: "..." }], metadata: { sessionID, status } },
+    },
+  ],
+});
+const reported = (childID: string, state = "completed") => ({
+  type: "synthetic",
+  text: `<subagent sessionID="${childID}" state="${state}">done</subagent>`,
+  metadata: { source: "subagent", childID, state },
+});
+
+test("running subagents are background launches that have not reported back, carried across compactions", () => {
+  const previous = `summary\n\n${open("running-subagents")}\nBackground subagents still running.\nses_old (general): Mine the logs\nses_early: Earlier job\n${close("running-subagents")}`;
+  const carried = carriedSubagents(previous);
+  assert.deepEqual(carried, [
+    { sessionID: "ses_old", agent: "general", description: "Mine the logs" },
+    { sessionID: "ses_early", agent: undefined, description: "Earlier job" },
+  ]);
+  const running = runningSubagents(
+    [
+      launch("ses_a", "worker", "Write docs"),
+      launch("ses_fg", "explore", "Map code", "completed"),
+      launch("ses_b", "reviewer", "Review"),
+      reported("ses_a"),
+      reported("ses_early", "error"),
+      { type: "user", text: "keep going" },
+    ] as never,
+    carried,
+  );
+  assert.deepEqual(
+    running.map((subagent) => subagent.sessionID),
+    ["ses_old", "ses_b"],
+    "finished, failed, and foreground subagents are left out",
+  );
+  const awkward = { sessionID: "ses_x1", agent: "worker (fast)", description: "Fix <a> & b\nses_phantom (x): no" };
+  const block = formatFileOperationsXml({ runningSubagents: [formatSubagent(awkward)] });
+  assert.deepEqual(carriedSubagents(`summary${block}`), [
+    { sessionID: "ses_x1", agent: "worker fast", description: "Fix <a> & b ses_phantom (x): no" },
+  ], "labels survive the appendix round trip as one line each");
+  assert.deepEqual(runningSubagents([launch("ses_a", "worker", "Again"), reported("ses_a"), launch("ses_a", "worker", "Follow-up")] as never), [
+    { sessionID: "ses_a", agent: "worker", description: "Follow-up" },
+  ], "a resumed subagent is running again until its next report");
+});
+
 type CompactionHook = (event: Record<string, unknown>) => Promise<void>;
 type Generate = (input: { prompt: string; model: unknown }) => Promise<{ text: string }>;
 
@@ -163,7 +237,7 @@ const SIX_SECTIONS = [
   "## 6. Resume Anchor & Immediate Next Action",
 ].join("\n");
 
-async function load(generate: Generate, events: unknown[] = []) {
+async function load(generate: Generate, events: unknown[] = [], context: unknown[] = []) {
   let hook: CompactionHook | undefined;
   const ctx = {
     location: { directory: os.tmpdir() },
@@ -180,6 +254,7 @@ async function load(generate: Generate, events: unknown[] = []) {
         return { dispose: async () => {} };
       },
       get: async () => ({ location: { directory: os.tmpdir() }, model: { providerID: "cliproxy", id: "factory/claude-sonnet-5-5" } }),
+      context: async () => context,
     },
     generate: { text: generate },
   };
@@ -209,6 +284,7 @@ test("the compaction hook writes the checkpoint with the session's model and com
       return { text: SIX_SECTIONS };
     },
     [shell("sh_live", "ses_1"), shell("sh_other", "ses_2"), shell("sh_done", "ses_1"), { type: "shell.exited", data: { id: "sh_done", status: "exited" } }],
+    [launch("ses_child", "reviewer", "Review the diff")],
   );
   assert.equal(plugin.id, "opencode-smart-compaction");
 
@@ -222,6 +298,7 @@ test("the compaction hook writes the checkpoint with the session's model and com
   assert.ok(event.result?.summary.includes(`${open(TOUCHED)}\nsrc/app.ts\n${close(TOUCHED)}`));
   assert.match(event.result?.summary ?? "", /dev sh_live \(shell sh_live, pid 7/, "running background shells are listed");
   assert.doesNotMatch(event.result?.summary ?? "", /sh_other|sh_done/);
+  assert.ok(event.result?.summary.includes("\nses_child (reviewer): Review the diff\n"), "running subagents are listed");
 });
 
 test("an incomplete summary is retried with default settings, then the session model", async () => {

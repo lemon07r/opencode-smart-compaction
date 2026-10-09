@@ -39,8 +39,9 @@ function touchPath(paths: Set<string>, file: string): void {
   paths.add(file);
 }
 
+/** The most recently used paths, oldest first, so a carried-over list keeps its recency order. */
 function newestPaths(paths: Iterable<string>, limit: number): string[] {
-  return [...paths].slice(-limit).sort();
+  return [...paths].slice(-limit);
 }
 
 export interface SessionFacts {
@@ -210,8 +211,8 @@ const unescapeXml = (text: string) =>
     .replace(/&apos;/g, "'")
     .replace(/&amp;/g, "&");
 
-/** A file list the plugin appended to a previous checkpoint, so file activity accumulates across compactions. */
-function appendedFileList(summary: string | undefined, name: string): string[] {
+/** A list the plugin appended to a previous checkpoint, so file activity and running subagents carry across compactions. */
+export function appendedList(summary: string | undefined, name: string): string[] {
   const block = summary?.match(new RegExp(`\\n${tag(name)}\\n([\\s\\S]*?)\\n${tag(name, true)}`))?.[1];
   return block ? block.split("\n").map(unescapeXml).filter(Boolean) : [];
 }
@@ -260,8 +261,8 @@ export function readSessionFacts(messages: readonly Message[]): SessionFacts {
     if (line) lines.push(line);
   }
 
-  const read = new Set(appendedFileList(previousSummary, "read-files"));
-  const modified = new Set(appendedFileList(previousSummary, "touched-files"));
+  const read = new Set(appendedList(previousSummary, "read-files"));
+  const modified = new Set(appendedList(previousSummary, "touched-files"));
   for (const call of calls) {
     if (call.id !== undefined && failed.has(call.id)) continue;
     if (READ_TOOLS.has(call.name)) {
@@ -278,11 +279,12 @@ export function readSessionFacts(messages: readonly Message[]): SessionFacts {
     }
   }
 
+  const modifiedFiles = newestPaths(modified, MAX_MODIFIED_FILES);
   return {
     userTexts,
     previousSummary,
-    readFiles: newestPaths([...read].filter((file) => !modified.has(file)), MAX_READ_FILES),
-    modifiedFiles: newestPaths(modified, MAX_MODIFIED_FILES),
+    readFiles: newestPaths([...read].filter((file) => !modifiedFiles.includes(file)), MAX_READ_FILES),
+    modifiedFiles,
     transcript: lines.join("\n\n"),
   };
 }

@@ -2,7 +2,7 @@
 
 Smart Compaction for [OpenCode](https://opencode.ai) 2. When OpenCode compacts a long session, this plugin writes the checkpoint itself: a structured six-section summary that keeps the identifiers it must not lose and ends with the exact file and worktree state.
 
-It is the OpenCode counterpart of the Smart Compaction extension in [shariq-pi-extensions](https://github.com/shariqriazz/shariq-pi-extensions) and produces the same checkpoint format.
+It started as a port of the Smart Compaction extension in [shariq-pi-extensions](https://github.com/shariqriazz/shariq-pi-extensions) and is now developed for OpenCode on its own.
 
 ## What a checkpoint contains
 
@@ -10,7 +10,7 @@ The model writes six sections:
 
 1. Primary goal and constraints, including every "never do X" rule the user stated.
 2. Progress ledger: done, in progress (with batch counts), and blocked.
-3. Code changes with verbatim snippets of in-flight work.
+3. Code changes with short verbatim snippets of in-flight work.
 4. Errors, root causes, and fixes.
 5. Key decisions and discarded approaches.
 6. Resume anchor and the next concrete step.
@@ -18,7 +18,7 @@ The model writes six sections:
 The plugin then adds two things the model doesn't write:
 
 - **Retained identifiers.** Commit SHAs, UUIDs, URLs, and IPv4 addresses from your messages or the previous checkpoint are protected. Any the summary dropped are appended verbatim under `### Retained Identifiers`.
-- **File and worktree state.** Files the session read or changed through tools, accumulated across compactions; the files git reports as dirty; lockfile and generated-asset changes; background shells the session still has running, so the next turn doesn't start a duplicate dev server; and a bounded diff of uncommitted work, including previews of untracked files. Untracked symlinks are never followed.
+- **File and worktree state.** Files the session read or changed through tools, accumulated across compactions and capped to the 40 read and 60 changed files used most recently; the files git reports as dirty; lockfile and generated-asset changes; background shells the session still has running, so the next turn doesn't start a duplicate dev server; background subagents that haven't reported back, so the next turn waits for them instead of polling or launching them again; and a bounded diff of uncommitted work, including previews of untracked files. Untracked symlinks are never followed.
 
 The conversation goes to the model in a bounded form: long tool output keeps its beginning and end, failures and the newest messages get more room, large tool arguments such as file contents are shortened, and terminal escape codes and repeated lines are removed. Session history itself is never changed.
 
