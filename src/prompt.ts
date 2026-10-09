@@ -100,6 +100,9 @@ Use this EXACT format with all 6 numbered section headings:
 - **Last State**: [Exact state immediately before this checkpoint]
 - **Next Concrete Step**: [The single immediate next action]`;
 
+export const RECENT_SUMMARIZED_NOTE =
+  "The summary above also covers the turns in the recent context below, which may start partway through when it is long.";
+
 export const RUNNING_SUBAGENTS_NOTE =
   "Background subagents still running; each reports back automatically when it finishes. Do not poll, relaunch, or duplicate their work.";
 
@@ -130,7 +133,7 @@ export function extractProtectedFacts(userTexts: readonly string[], previousSumm
   const userSources = [...userTexts];
   const identifierSources = [...userSources];
   if (previousSummary) {
-    const semanticSummary = previousSummary.split(/\n\n<(?:read-files|touched-files|uncommitted-dirty-files|modified-lockfiles-and-assets|active-background-processes|running-subagents|uncommitted-diff)>/i)[0];
+    const semanticSummary = previousSummary.split(/\n\n<(?:read-files|touched-files|uncommitted-dirty-files|modified-lockfiles-and-assets|active-background-processes|running-subagents|uncommitted-diff|recent-context-summarized)>/i)[0];
     identifierSources.push(semanticSummary);
   }
 
@@ -161,6 +164,7 @@ export function formatFileOperationsXml(options?: {
   activeBackgroundProcesses?: Iterable<string>;
   runningSubagents?: Iterable<string>;
   lockfilesAndGeneratedAssets?: Iterable<string>;
+  recentSummarized?: boolean;
 }): string {
   if (!options) return "";
   const readSet = new Set(options.readFiles ?? []);
@@ -201,6 +205,9 @@ export function formatFileOperationsXml(options?: {
   }
   if (options.dirtyStateAvailable === false) {
     sections.push("<uncommitted-state-unavailable />");
+  }
+  if (options.recentSummarized) {
+    sections.push(`<recent-context-summarized>\n${escapeXml(RECENT_SUMMARIZED_NOTE)}\n</recent-context-summarized>`);
   }
 
   if (sections.length === 0) return "";

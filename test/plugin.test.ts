@@ -6,8 +6,9 @@ import * as path from "node:path";
 import test from "node:test";
 import { buildCheckpoint, completeSummary, RETAINED_IDENTIFIERS_HEADING, semanticSummary } from "../src/checkpoint.ts";
 import { getGitEngineeringState } from "../src/git-state.ts";
-import { readSessionFacts } from "../src/session.ts";
+import { parseCheckpoint, readSessionFacts, summarizesRecent } from "../src/session.ts";
 import { formatFileOperationsXml } from "../src/prompt.ts";
+import { asTranscriptMessages, boundRecent, canSummarizeKept, keptMessages, RECENT_OMITTED_NOTE, trimRecentContext } from "../src/recent.ts";
 import { carriedSubagents, formatSubagent, runningSubagents } from "../src/subagents.ts";
 import plugin from "../src/index.ts";
 
@@ -18,6 +19,7 @@ const close = (name: string) => `</${name}>`;
 const TOUCHED = "touched-files";
 
 type Messages = Parameters<typeof readSessionFacts>[0];
+type Message = Messages[number];
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
 const call = (id: string, name: string, input: Record<string, unknown>) => ({
   role: "assistant",
@@ -225,6 +227,17 @@ test("running subagents are background launches that have not reported back, car
   ], "a resumed subagent is running again until its next report");
 });
 
+test("completed foreground results remove carried and running subagents", () => {
+  const carried = [{ sessionID: "ses_carried", agent: "worker", description: "Earlier work" }];
+  assert.deepEqual(runningSubagents([
+    launch("ses_carried", "worker", "Finished", "completed"),
+    launch("ses_running", "worker", "Start"),
+    launch("ses_running", "worker", "Finished", "completed"),
+    launch("ses_untouched", "worker", "Keep running"),
+    launch("ses_untouched", "worker", "Unverified status", "cancelled"),
+  ] as never, carried), [{ sessionID: "ses_untouched", agent: "worker", description: "Keep running" }]);
+});
+
 type CompactionHook = (event: Record<string, unknown>) => Promise<void>;
 type Generate = (input: { prompt: string; model: unknown }) => Promise<{ text: string }>;
 
@@ -237,11 +250,11 @@ const SIX_SECTIONS = [
   "## 6. Resume Anchor & Immediate Next Action",
 ].join("\n");
 
-async function load(generate: Generate, events: unknown[] = [], context: unknown[] = []) {
-  let hook: CompactionHook | undefined;
+async function loadHooks(generate: Generate, events: unknown[] = [], context: unknown[] | Error = [], options: Record<string, unknown> = {}) {
+  const hooks = new Map<string, CompactionHook>();
   const ctx = {
     location: { directory: os.tmpdir() },
-    options: { thresholdMode: "off" },
+    options: { thresholdMode: "off", ...options },
     event: {
       subscribe: async function* () {
         yield* events;
@@ -249,18 +262,25 @@ async function load(generate: Generate, events: unknown[] = [], context: unknown
     },
     session: {
       hook: async (name: string, callback: CompactionHook) => {
-        assert.equal(name, "compaction");
-        hook = callback;
+        hooks.set(name, callback);
         return { dispose: async () => {} };
       },
       get: async () => ({ location: { directory: os.tmpdir() }, model: { providerID: "cliproxy", id: "factory/claude-sonnet-5-5" } }),
-      context: async () => context,
+      context: async () => {
+        if (context instanceof Error) throw context;
+        return context;
+      },
     },
     generate: { text: generate },
   };
   const stop = await plugin.setup(ctx as never);
   await new Promise((resolve) => setImmediate(resolve));
   if (typeof stop === "function") await stop();
+  return hooks;
+}
+
+async function load(generate: Generate, events: unknown[] = [], context: unknown[] = []) {
+  const hook = (await loadHooks(generate, events, context)).get("compaction");
   assert.ok(hook, "the plugin registers a compaction hook");
   return hook;
 }
@@ -345,4 +365,286 @@ test("a failed, empty, or incomplete generation leaves OpenCode's own compaction
   const cut = compactionEvent();
   await partial(cut);
   assert.equal(cut.result, undefined);
+});
+const summarized = (summary: string) => `${summary}\n\n${open("recent-context-summarized")}\nnote\n${close("recent-context-summarized")}`;
+const withID = <T extends object>(id: string, message: T) => ({ id, ...message });
+
+test("the turns OpenCode keeps verbatim are found by ID and read like the summarized ones", () => {
+  const summarizedMessages = [withID("m1", user("start")), withID("m2", call("c1", "read", { path: "/repo/a.ts" }))] as unknown as Messages;
+  const stored = [
+    { id: "m1", type: "user", text: "start" },
+    { id: "m2", type: "assistant", content: [] },
+    { id: "m3", type: "user", text: "Now deploy to https://kept.example.com" },
+    {
+      id: "m4",
+      type: "assistant",
+      content: [
+        { type: "reasoning", text: "thinking" },
+        { type: "tool", id: "t1", name: "edit", state: { status: "completed", input: { path: "/repo/kept.ts" }, content: [{ type: "text", text: "ok" }] } },
+        { type: "tool", id: "t2", name: "write", state: { status: "error", input: { path: "/repo/denied.ts" }, error: { message: "denied" } } },
+        { type: "text", text: "Done." },
+      ],
+    },
+    { id: "m5", type: "synthetic", text: "background job finished", metadata: { source: "subagent" } },
+  ];
+  const kept = keptMessages(summarizedMessages, stored as never);
+  assert.deepEqual(kept?.map((message) => message.id), ["m3", "m4", "m5"]);
+  assert.equal(keptMessages([user("no ids")] as unknown as Messages, stored as never), undefined, "no match means no coverage");
+
+  const facts = readSessionFacts([...summarizedMessages, ...asTranscriptMessages(kept!)]);
+  assert.ok(facts.userTexts.includes("Now deploy to https://kept.example.com"), "kept user words are protected");
+  assert.ok(!facts.userTexts.includes("background job finished"), "synthetic text is not user-authored");
+  assert.deepEqual(facts.modifiedFiles, ["/repo/kept.ts"], "failed calls in kept turns don't count");
+  assert.match(facts.transcript, /\[Tool error: write\]: denied/);
+  assert.match(facts.transcript, /\[Assistant\]: Done\.\n\n\[Tool result: edit\]: ok\n\n\[Tool error: write\]: denied\n\n\[Assistant\]: \[Synthetic context\] \(source: subagent\): background job finished$/);
+  assert.ok(canSummarizeKept(kept!));
+
+  const covered = readSessionFacts([checkpointMessage(summarized("old"), "[User]: Keep 10.0.0.9\n[Assistant tool call]: read({\"path\":\"/repo/r.ts\"})\n[Tool result]: x"), user("next")] as unknown as Messages);
+  assert.equal(covered.transcript, "[User]: next", "a recent context the previous summary covered is not summarized again");
+  assert.ok(covered.userTexts.includes("Keep 10.0.0.9"));
+  assert.deepEqual(covered.readFiles, ["/repo/r.ts"]);
+});
+
+test("a long recent context keeps its newest turns, starting at a turn", () => {
+  assert.equal(boundRecent("[User]: short", 100), undefined);
+  const recent = ["[User]: first", `[Assistant tool call]: read({"path":"/a"})`, `[Tool result]: ${"r".repeat(200)}`, "[Assistant]: newest"].join("\n");
+  const cap = RECENT_OMITTED_NOTE.length + 1 + 60;
+  const bounded = boundRecent(recent, cap)!;
+  assert.equal(bounded, `${RECENT_OMITTED_NOTE}\n[Assistant]: newest`, "a cut never starts on a tool result");
+  assert.ok(bounded.length <= cap, "the omission note counts toward the cap");
+  const single = boundRecent(`[User]: ${"line\n".repeat(50)}end`, RECENT_OMITTED_NOTE.length + 1 + 30)!;
+  assert.ok(single.startsWith(`${RECENT_OMITTED_NOTE}\nline\n`) && single.endsWith("end"), "one huge turn is cut at a line");
+  assert.ok(single.length <= RECENT_OMITTED_NOTE.length + 1 + 30);
+});
+
+test("recent context obeys exact character budgets for huge turns and tiny caps", () => {
+  const singleLine = `[User]: ${"x".repeat(1_000)}end`;
+  const multiline = `[Assistant]: ${"line\n".repeat(300)}end`;
+  const normalTurns = Array.from({ length: 50 }, (_, i) => `[User]: turn ${i}`).join("\n");
+  for (const recent of [singleLine, multiline, normalTurns]) {
+    for (const cap of [-1, 0, 1, 20, RECENT_OMITTED_NOTE.length, RECENT_OMITTED_NOTE.length + 1, 200, 400]) {
+      const bounded = boundRecent(recent, cap)!;
+      assert.ok(bounded.length <= Math.max(0, cap), `budget ${cap} includes the omission note`);
+      assert.equal(boundRecent(recent, cap), bounded, "cuts are deterministic");
+      assert.equal(boundRecent(bounded, cap), undefined, "a bounded block needs no second trim");
+      if (cap <= RECENT_OMITTED_NOTE.length) assert.equal(bounded, RECENT_OMITTED_NOTE.slice(0, Math.max(0, cap)));
+      if (cap >= 200 && recent !== normalTurns) assert.ok(bounded.endsWith("end"));
+    }
+  }
+  assert.equal(boundRecent(singleLine, 200), `${RECENT_OMITTED_NOTE}\n${singleLine.slice(-(200 - RECENT_OMITTED_NOTE.length - 1))}`);
+  assert.equal(boundRecent("fits exactly", "fits exactly".length), undefined);
+});
+
+test("the context hook bounds only recent context the checkpoint summarized, without touching the stored message", async () => {
+  const long = Array.from({ length: 50 }, (_, i) => `[User]: turn ${i} ${"x".repeat(100)}`).join("\n");
+  const marked = checkpointMessage(summarized("summary"), long);
+  const unmarked = checkpointMessage("summary", long);
+  const messages = [marked, unmarked, user("latest")] as unknown as Message[];
+  assert.equal(trimRecentContext(messages, 300), 1);
+  const text = (messages[0] as unknown as typeof marked).content[0]!.text;
+  assert.ok(text.includes(`${open("recent-context")}\n${RECENT_OMITTED_NOTE}\n[User]: turn `));
+  assert.ok(text.endsWith(`[User]: turn 49 ${"x".repeat(100)}\n${close("recent-context")}\n${close("conversation-checkpoint")}`));
+  assert.ok(text.length < 1_800 && text.includes(open("recent-context-summarized")));
+  assert.equal(messages[1], unmarked, "an unmarked checkpoint is left whole");
+  assert.equal(marked.content[0]!.text.length > 5_000, true, "the original message object is unchanged");
+  assert.ok((parseCheckpoint(text)?.recent?.length ?? Infinity) <= 1_200, "the complete recent block fits the token budget");
+  const boundedMessage = messages[0];
+  assert.equal(trimRecentContext(messages, 300), 0, "repeated trimming is idempotent");
+  assert.equal(messages[0], boundedMessage, "an already bounded object is unchanged");
+  const repeated = [marked] as unknown as Message[];
+  assert.equal(trimRecentContext(repeated, 300), 1);
+  assert.equal((repeated[0] as unknown as typeof marked).content[0]!.text, text, "the same stored checkpoint produces the same request");
+  assert.equal(trimRecentContext(messages, 0), 0);
+
+  const hooks = await loadHooks(async () => ({ text: SIX_SECTIONS }), [], [], { maxRecentTokens: 75 });
+  const event = { messages: [checkpointMessage(summarized("summary"), long)] };
+  await hooks.get("context")?.(event);
+  assert.ok(event.messages[0]!.content[0]!.text.length < 1_000, "the plugin registers the context hook with its option");
+  assert.equal((await loadHooks(async () => ({ text: SIX_SECTIONS }), [], [], { maxRecentTokens: 0 })).has("context"), false);
+});
+
+test("the compaction hook summarizes the kept turns and marks the checkpoint", async () => {
+  let prompt = "";
+  const hook = await load(
+    async (input) => {
+      prompt = input.prompt;
+      return { text: SIX_SECTIONS };
+    },
+    [],
+    [
+      { id: "u1", type: "user", text: `Ship ${SHA}` },
+      { id: "a1", type: "assistant", content: [] },
+      { id: "u2", type: "user", text: "kept instruction" },
+    ],
+  );
+  const event = compactionEvent();
+  event.messages = [withID("u1", user(`Ship ${SHA}`)), withID("a1", call("1", "edit", { path: "src/app.ts" }))] as never;
+  await hook(event);
+  assert.ok(prompt.includes("[User]: kept instruction"), "kept turns are in the conversation to summarize");
+  assert.ok(event.result?.summary.includes(`\n${open("recent-context-summarized")}\n`));
+
+  const unmatched = compactionEvent();
+  await (await load(async () => ({ text: SIX_SECTIONS }), [], [])).call(undefined, unmatched);
+  assert.ok(!unmatched.result?.summary.includes(open("recent-context-summarized")), "no marker without kept-turn coverage");
+});
+
+test("checkpoint-only requests find kept turns by an exact completed-compaction summary", async () => {
+  const summary = summarized(SIX_SECTIONS);
+  const stored = [
+    { id: "old", type: "user", text: "older turn" },
+    { id: "checkpoint", type: "compaction", status: "completed", summary: `  ${summary}\n`, recent: "" },
+    { id: "tail", type: "user", text: "checkpoint-only kept turn" },
+    { id: "unknown", type: "model-switched", model: { providerID: "p", id: "m" } },
+  ];
+  const request = [checkpointMessage(summary, "[User]: earlier recent turn")] as unknown as Messages;
+  assert.deepEqual(keptMessages(request, stored as never), stored.slice(2), "the wrapper has no request ID");
+  assert.equal(keptMessages([checkpointMessage(`${summary}\nchanged`)] as unknown as Messages, stored as never), undefined);
+  assert.equal(keptMessages(request, [{ ...stored[1], status: "running" }] as never), undefined, "only completed compactions match");
+  assert.deepEqual(keptMessages([withID("tail", checkpointMessage(summary))] as unknown as Messages, stored as never), stored.slice(3), "ID matching takes priority");
+
+  let prompt = "";
+  const hooks = await loadHooks(async (input) => {
+    prompt = input.prompt;
+    return { text: SIX_SECTIONS };
+  }, [], stored.slice(0, 3));
+  const matched = compactionEvent();
+  matched.messages = request as never;
+  await hooks.get("compaction")!(matched);
+  assert.ok(prompt.includes("[User]: checkpoint-only kept turn"));
+  assert.ok(summarizesRecent(matched.result?.summary));
+
+  const mismatched = compactionEvent();
+  mismatched.messages = [checkpointMessage(`${SIX_SECTIONS}\nchanged`, "[User]: earlier recent turn")] as never;
+  await hooks.get("compaction")!(mismatched);
+  assert.ok(mismatched.result, "an unmatched boundary still allows a summary of the known request");
+  assert.ok(!summarizesRecent(mismatched.result.summary));
+  assert.ok(!prompt.includes("checkpoint-only kept turn"));
+  const untouched = checkpointMessage(mismatched.result.summary, `[User]: ${"x".repeat(2_000)}`);
+  const contextEvent = { messages: [untouched] };
+  await hooks.get("context")!(contextEvent);
+  assert.equal(contextEvent.messages[0], untouched, "a mismatched checkpoint is never trimmed");
+});
+
+test("skill, system, synthetic, and shell history reach the prompt without becoming user text", async () => {
+  const tail = [
+    { id: "skill", type: "skill", skill: "skills/deploy", name: "Deploy", text: "Skill instructions: verify the release" },
+    { id: "system", type: "system", text: "Historical system directive" },
+    { id: "synthetic", type: "synthetic", text: "Synthetic completion", metadata: { source: "subagent", childID: "ses_child" } },
+    {
+      id: "shell", type: "shell", shellID: "sh_check", command: "bun run check", status: "exited", exit: 1,
+      output: { output: `\x1b[31mstarting\x1b[0m\n${"build output\n".repeat(600)}${Array.from({ length: 400 }, (_, i) => `build step ${i}\n`).join("")}checking\rdone\nFATAL: release failed`, cursor: 1, size: 10_000, truncated: false },
+    },
+    { id: "shell_running", type: "shell", shellID: "sh_watch", command: "bun run dev", status: "running" },
+    {
+      id: "assistant", type: "assistant", content: [
+        { type: "tool", id: "t_running", name: "read", state: { status: "running", input: { path: "/repo/live.ts" }, metadata: {} } },
+        { type: "tool", id: "t_error", name: "shell", state: { status: "error", input: { command: "bun test" }, error: { message: "failed" }, content: [{ type: "text", text: "Detailed test failure" }] } },
+      ],
+    },
+    { id: "idle", type: "idle", outcome: "succeeded" },
+    { id: "user", type: "user", text: "Only these are user words", files: [], agents: [], skills: [] },
+  ];
+  assert.ok(canSummarizeKept(tail as never));
+  const transcriptMessages = asTranscriptMessages(tail as never);
+  const facts = readSessionFacts(transcriptMessages);
+  assert.deepEqual(facts.userTexts, ["Only these are user words"]);
+  assert.match(facts.transcript, /\[Assistant\]: \[Historical skill context: Deploy \(skills\/deploy\)\]: Skill instructions/);
+  assert.match(facts.transcript, /\[Assistant\]: \[Historical system context\]: Historical system directive/);
+  assert.match(facts.transcript, /\[Assistant\]: \[Synthetic context\] \(source: subagent\): Synthetic completion/);
+  assert.match(facts.transcript, /shell\(command="bun run check", status="exited", exit=1\)/);
+  assert.match(facts.transcript, /\[Tool result: shell\]: status=exited, exit=1\nstarting/);
+  assert.match(facts.transcript, /done\nFATAL: release failed/);
+  assert.match(facts.transcript, /previous line repeated \d+ more times/);
+  assert.match(facts.transcript, /\[\.\.\. \d+ characters omitted; showing beginning and end of output \.\.\.\]/);
+  assert.ok(!facts.transcript.includes("build step 200"), "stored shell output uses the existing result budget");
+  assert.doesNotMatch(facts.transcript, /\x1b|checking|build output\nbuild output/);
+  assert.match(facts.transcript, /shell\(command="bun run dev", status="running", exit=undefined\)/);
+  assert.match(facts.transcript, /\[Tool result: shell\]: status=running, exit=unknown/);
+  assert.match(facts.transcript, /\[Tool status: read \(t_running\)\]: running/);
+  assert.ok(!transcriptMessages.some((message) => message.content.some((part) => part.type === "tool-result" && part.id === "t_running")), "a running tool has no completed result");
+  assert.match(facts.transcript, /\[Tool error: shell\]: failed\nDetailed test failure/);
+
+  let prompt = "";
+  const hooks = await loadHooks(async (input) => {
+    prompt = input.prompt;
+    return { text: SIX_SECTIONS };
+  }, [], [{ id: "boundary", type: "user", text: "start" }, ...tail]);
+  const event = compactionEvent();
+  event.messages = [withID("boundary", user("start"))] as never;
+  await hooks.get("compaction")!(event);
+  for (const expected of ["Skill instructions: verify the release", "Historical system directive", "Synthetic completion", "FATAL: release failed", "status=running, exit=unknown", "[Tool status: read (t_running)]: running"]) {
+    assert.ok(prompt.includes(expected), `${expected} reaches summary generation`);
+  }
+  assert.ok(summarizesRecent(event.result?.summary));
+});
+
+test("unsupported stored content and attachments withhold the kept-tail marker", async () => {
+  const unsupported = [
+    { type: "compaction", status: "completed", summary: "other checkpoint", recent: "unknown recent content" },
+    { type: "compaction", status: "running", summary: "unfinished", recent: "unknown recent content" },
+    { type: "compaction", status: "failed", error: { message: "failed" } },
+    { type: "agent-switched", agent: "worker" },
+    { type: "model-switched", model: { providerID: "p", id: "m" } },
+    { type: "location-switched", directory: "/other" },
+    { type: "future-message", text: "unrecognized content" },
+    { type: "user", text: "inline attachment", files: [{ data: "ZmlsZQ==", mime: "text/plain", source: { type: "inline" } }] },
+    { type: "user", text: "URI attachment", files: [{ data: "", mime: "image/png", source: { type: "uri", uri: "file:///repo/picture.png" } }] },
+    { type: "user", text: "agent attachment", agents: [{ name: "worker" }] },
+    { type: "user", text: "skill attachment", skills: [{ id: "skills/deploy", name: "Deploy", text: "inline skill" }] },
+    { type: "assistant", content: [{ type: "text", text: "partial assistant" }, { type: "tool", id: "stream", name: "shell", state: { status: "streaming", input: "{\"command\":" } }] },
+    { type: "assistant", content: [{ type: "future-part", text: "unrecognized part" }] },
+    { type: "assistant", content: [{ type: "tool", id: "file", name: "read", state: { status: "completed", input: {}, content: [{ type: "file", uri: "file:///repo/picture.png", mime: "image/png" }] } }] },
+    { type: "assistant", content: [{ type: "tool", id: "file_error", name: "read", state: { status: "error", input: {}, error: { message: "failed" }, content: [{ type: "file", uri: "file:///repo/picture.png", mime: "image/png" }] } }] },
+  ];
+  for (const [index, message] of unsupported.entries()) {
+    assert.equal(canSummarizeKept([message] as never), false, `unsupported fixture ${index} is not covered`);
+    let prompt = "";
+    const hooks = await loadHooks(async (input) => {
+      prompt = input.prompt;
+      return { text: SIX_SECTIONS };
+    }, [], [
+      { id: "boundary", type: "user", text: "start" },
+      { id: "partial", type: "user", text: "partially adapted tail" },
+      { id: `unsupported-${index}`, ...message },
+    ], { maxRecentTokens: 50 });
+    const event = compactionEvent();
+    event.messages = [withID("boundary", user("start"))] as never;
+    await hooks.get("compaction")!(event);
+    assert.ok(prompt.includes("[User]: partially adapted tail"), "known portions still enrich the summary");
+    assert.ok(event.result, `unsupported fixture ${index} still generates a summary`);
+    assert.ok(!summarizesRecent(event.result.summary), `unsupported fixture ${index} withholds the marker`);
+    const original = checkpointMessage(event.result.summary, `[User]: ${"x".repeat(1_000)}`);
+    const contextEvent = { messages: [original] };
+    await hooks.get("context")!(contextEvent);
+    assert.equal(contextEvent.messages[0], original, "unsupported tails are left whole");
+  }
+  assert.ok(canSummarizeKept([]), "an empty matched tail has no unsupported content");
+});
+
+test("a context-read failure retains carried subagents and never marks or trims the kept tail", async () => {
+  const previous = `${SIX_SECTIONS}\n\n${open("running-subagents")}\nBackground subagents still running.\nses_carried (worker): Preserve this child\n${close("running-subagents")}`;
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (message: string) => warnings.push(message);
+  try {
+    let attempts = 0;
+    const hooks = await loadHooks(async () => {
+      attempts++;
+      return { text: SIX_SECTIONS };
+    }, [], new Error("context offline"), { maxRecentTokens: 50 });
+    const event = compactionEvent();
+    event.messages = [checkpointMessage(previous, "[User]: earlier recent turn"), user("Keep working")] as never;
+    await hooks.get("compaction")!(event);
+    assert.equal(attempts, 1, "the plugin generates rather than handing off to a built-in summary");
+    assert.ok(event.result?.summary.includes("\nses_carried (worker): Preserve this child\n"));
+    assert.ok(!summarizesRecent(event.result?.summary));
+    const original = checkpointMessage(event.result!.summary, `[User]: ${"x".repeat(1_000)}`);
+    const contextEvent = { messages: [original] };
+    await hooks.get("context")!(contextEvent);
+    assert.equal(contextEvent.messages[0], original, "a context-read failure leaves the recent block untrimmed");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /new subagent launches unavailable, previously recorded children retained, recent context left untrimmed: Error: context offline/);
+  } finally {
+    console.warn = originalWarn;
+  }
 });

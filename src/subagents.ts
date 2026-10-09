@@ -39,6 +39,7 @@ export function carriedSubagents(previousSummary: string | undefined): RunningSu
  * the last compaction, including the turns OpenCode keeps verbatim). The `subagent` tool returns at once with
  * `metadata.status` "running" when it backgrounds a child session, and OpenCode later delivers a synthetic message
  * with `metadata.source` "subagent" and the child's ID when that session completes, fails, or is cancelled.
+ * A foreground result with `metadata.status` "completed" also ends a carried or running entry.
  */
 export function runningSubagents(messages: readonly ContextMessage[], carried: readonly RunningSubagent[] = []): RunningSubagent[] {
   const running = new Map(carried.map((subagent) => [subagent.sessionID, subagent]));
@@ -48,7 +49,12 @@ export function runningSubagents(messages: readonly ContextMessage[], carried: r
         if (part.type !== "tool" || part.name !== "subagent" || part.state.status !== "completed") continue;
         const { input, metadata } = part.state;
         const sessionID = text(metadata?.sessionID);
-        if (metadata?.status !== "running" || !sessionID) continue;
+        if (!sessionID) continue;
+        if (metadata?.status === "completed") {
+          running.delete(sessionID);
+          continue;
+        }
+        if (metadata?.status !== "running") continue;
         running.delete(sessionID);
         running.set(sessionID, { sessionID, agent: text(input.agent), description: text(input.description) });
       }

@@ -9,12 +9,13 @@ import type { SessionCompaction } from "@opencode/plugin/promise/session";
 type Message = SessionCompaction["messages"][number];
 
 // Tag names are assembled so the literal markup never appears in this source.
-const tag = (name: string, close = false) => `<${close ? "/" : ""}${name}>`;
-const CHECKPOINT_OPEN = tag("conversation-checkpoint");
+export const tag = (name: string, close = false) => `<${close ? "/" : ""}${name}>`;
+export const CHECKPOINT_OPEN = tag("conversation-checkpoint");
 const SUMMARY_OPEN = tag("summary");
-const SUMMARY_CLOSE = tag("summary", true);
-const RECENT_OPEN = `${SUMMARY_CLOSE}\n\n${tag("recent-context")}\n`;
-const RECENT_CLOSE = `\n${tag("recent-context", true)}`;
+export const SUMMARY_CLOSE = tag("summary", true);
+export const RECENT_OPEN = `${SUMMARY_CLOSE}\n\n${tag("recent-context")}\n`;
+export const RECENT_CLOSE = `\n${tag("recent-context", true)}`;
+export const RECENT_SUMMARIZED_TAG = "recent-context-summarized";
 // A user turn in OpenCode's serialized recent context runs until the next speaker label.
 const RECENT_USER_TURN =
   /^\[User\]: ([\s\S]*?)(?=^\[(?:User|Assistant|Assistant reasoning|Assistant tool call|Tool result|Tool error|Shell|Synthetic context|Skill activated: [^\]\n]*|Attached [^\]\n]*)\]|(?![\s\S]))/gm;
@@ -59,6 +60,11 @@ function textOf(message: Message): string {
   return message.content
     .flatMap((part) => (part.type === "text" && part.text.trim() ? [part.text.trim()] : []))
     .join("\n");
+}
+
+/** Whether a checkpoint summary marks its recent context as already summarized, so it isn't summarized again. */
+export function summarizesRecent(summary: string | undefined): boolean {
+  return summary?.includes(`\n${tag(RECENT_SUMMARIZED_TAG)}\n`) ?? false;
 }
 
 export interface PreviousCheckpoint {
@@ -251,7 +257,7 @@ export function readSessionFacts(messages: readonly Message[]): SessionFacts {
         if (checkpoint.recent) {
           userTexts.push(...recentUserTexts(checkpoint.recent));
           calls.push(...recentToolCalls(checkpoint.recent));
-          lines.push(checkpoint.recent);
+          if (!summarizesRecent(checkpoint.summary)) lines.push(checkpoint.recent);
         }
         continue;
       }
