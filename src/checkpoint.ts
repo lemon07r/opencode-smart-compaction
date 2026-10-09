@@ -1,12 +1,11 @@
 /**
- * Builds the compaction prompt and completes the model's summary.
+ * Builds the checkpoint prompt and completes the model's summary.
  *
- * OpenCode appends the conversation after the prompt this module builds, so the
- * prompt carries everything else: the directives, the previous checkpoint (the
- * built-in prompt that normally carries it is replaced), and the protected
- * facts. After the model writes the summary, completeSummary restores any
- * protected identifier the model dropped and appends the exact file and
- * worktree state, as the Pi extension does.
+ * The prompt carries the whole request: the directives, the conversation being
+ * summarized, the previous checkpoint, and the protected facts. After the model
+ * writes the summary, completeSummary restores any protected identifier the
+ * model dropped and appends the exact file and worktree state, as the Pi
+ * extension does.
  */
 
 import {
@@ -21,6 +20,9 @@ import type { GitEngineeringState } from "./git-state.ts";
 import type { SessionFacts } from "./session.ts";
 
 export const RETAINED_IDENTIFIERS_HEADING = "### Retained Identifiers";
+
+const CONVERSATION_OPEN = "<conversation>";
+const CONVERSATION_CLOSE = "</conversation>";
 
 // Everything from the first appended state block on is regenerated each time,
 // so it is not fed back to the model as part of the previous checkpoint.
@@ -40,7 +42,10 @@ export function buildCheckpoint(facts: SessionFacts, git: GitEngineeringState): 
   const previousSummary = facts.previousSummary ? semanticSummary(facts.previousSummary) : undefined;
   const protectedFacts = extractProtectedFacts(facts.userTexts, previousSummary);
 
-  const sections = [SMART_COMPACTION_SYSTEM_PROMPT];
+  const sections = [
+    SMART_COMPACTION_SYSTEM_PROMPT,
+    `${CONVERSATION_OPEN}\n${sanitizeTagContent(facts.transcript)}\n${CONVERSATION_CLOSE}`,
+  ];
   if (previousSummary) {
     sections.push(`<previous-summary>\n${sanitizeTagContent(previousSummary)}\n</previous-summary>`);
   }

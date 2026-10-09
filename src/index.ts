@@ -1,68 +1,34 @@
-import type { Plugin } from "@opencode-ai/plugin";
-import { buildCheckpoint, completeSummary, type Checkpoint } from "./checkpoint.ts";
+import type { Plugin } from "@opencode/plugin";
+import { buildCheckpoint, completeSummary } from "./checkpoint.ts";
 import { getGitEngineeringState } from "./git-state.ts";
-import { readSessionFacts, type SessionEntry } from "./session.ts";
+import { readSessionFacts } from "./session.ts";
 
 const PLUGIN_ID = "opencode-smart-compaction";
 
 /**
- * OpenCode 1 server plugin. `experimental.session.compacting` replaces the
- * summary prompt with the Smart Compaction checkpoint prompt;
- * `experimental.text.complete` then finishes the summary the compaction agent
- * wrote. A compaction that fails anywhere falls back to OpenCode's own prompt
- * rather than blocking the session.
+ * OpenCode plugin. The session `compaction` hook writes the checkpoint itself:
+ * it builds the Smart Compaction prompt from the messages being summarized,
+ * generates the summary with the session's model, completes it, and returns it
+ * as the hook result so OpenCode skips its own summary request. Any failure
+ * leaves the result unset, and OpenCode compacts with its built-in prompt.
  */
-// The module exports only the plugin: OpenCode's legacy loader treats every
-// exported function as a plugin, so helpers stay in their own files.
-export const server: Plugin = async ({ client, directory, worktree }) => {
-  // One pending checkpoint per session, between the prompt and the finished summary.
-  const pending = new Map<string, Checkpoint>();
-
-  const isSummary = async (sessionID: string, messageID: string) => {
-    const response = await client.session.message({ path: { id: sessionID, messageID } });
-    return (response.data?.info as { summary?: boolean } | undefined)?.summary === true;
-  };
-
-  return {
-    "experimental.session.compacting": async (input, output) => {
-      pending.delete(input.sessionID);
+export default {
+  id: PLUGIN_ID,
+  async setup(ctx) {
+    await ctx.session.hook("compaction", async (event) => {
+      if (event.result) return;
       try {
-        const response = await client.session.messages({ path: { id: input.sessionID } });
-        const facts = readSessionFacts((response.data ?? []) as SessionEntry[]);
-        const git = await getGitEngineeringState(worktree || directory);
+        const facts = readSessionFacts(event.messages);
+        if (!facts.transcript.trim()) return;
+        const session = await ctx.session.get({ sessionID: event.sessionID });
+        const git = await getGitEngineeringState(session.location.directory || ctx.location.directory);
         const checkpoint = buildCheckpoint(facts, git);
-        output.prompt = checkpoint.prompt;
-        pending.set(input.sessionID, checkpoint);
+        const generated = await ctx.generate.text({ prompt: checkpoint.prompt, model: event.model });
+        if (!generated.text.trim()) return;
+        event.result = { summary: completeSummary(generated.text, checkpoint) };
       } catch (error) {
-        await client.app
-          .log({ body: { service: PLUGIN_ID, level: "warn", message: `Using OpenCode's compaction prompt: ${String(error)}` } })
-          .catch(() => undefined);
+        console.warn(`[${PLUGIN_ID}] using OpenCode's compaction: ${String(error)}`);
       }
-    },
-
-    "experimental.text.complete": async (input, output) => {
-      const checkpoint = pending.get(input.sessionID);
-      if (!checkpoint) return;
-      try {
-        if (!(await isSummary(input.sessionID, input.messageID))) return;
-        pending.delete(input.sessionID);
-        output.text = completeSummary(output.text, checkpoint);
-      } catch (error) {
-        await client.app
-          .log({ body: { service: PLUGIN_ID, level: "warn", message: `Summary left as written: ${String(error)}` } })
-          .catch(() => undefined);
-      }
-    },
-
-    event: async ({ event }) => {
-      // A failed or abandoned compaction must not attach its state to a later message.
-      if (event.type === "session.compacted" || event.type === "session.error" || event.type === "session.deleted") {
-        const sessionID = (event.properties as { sessionID?: string; info?: { id?: string } }).sessionID
-          ?? (event.properties as { info?: { id?: string } }).info?.id;
-        if (sessionID) pending.delete(sessionID);
-      }
-    },
-  };
-};
-
-export default { id: PLUGIN_ID, server };
+    });
+  },
+} satisfies Plugin.Plugin;

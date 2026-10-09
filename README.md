@@ -1,12 +1,12 @@
 # opencode-smart-compaction
 
-Smart Compaction for [OpenCode](https://opencode.ai). When OpenCode compacts a long session, this plugin replaces the summary prompt with a structured six-section checkpoint, keeps opaque identifiers the summary must not lose, and appends the exact file and worktree state after the model finishes writing.
+Smart Compaction for [OpenCode](https://opencode.ai) 2. When OpenCode compacts a long session, this plugin writes the checkpoint itself: a structured six-section summary that keeps the identifiers it must not lose and ends with the exact file and worktree state.
 
 It is the OpenCode counterpart of the Smart Compaction extension in [shariq-pi-extensions](https://github.com/shariqriazz/shariq-pi-extensions) and produces the same checkpoint format.
 
 ## What a checkpoint contains
 
-The compaction model writes six sections:
+The model writes six sections:
 
 1. Primary goal and constraints, including every "never do X" rule the user stated.
 2. Progress ledger: done, in progress (with batch counts), and blocked.
@@ -15,49 +15,45 @@ The compaction model writes six sections:
 5. Key decisions and discarded approaches.
 6. Resume anchor and the next concrete step.
 
-After the model finishes, the plugin adds two things the model doesn't write itself:
+The plugin then adds two things the model doesn't write:
 
-- **Retained identifiers.** Commit SHAs, UUIDs, URLs, and IPv4 addresses found in your messages or the previous checkpoint are protected. Any the summary dropped are appended verbatim under `### Retained Identifiers`.
+- **Retained identifiers.** Commit SHAs, UUIDs, URLs, and IPv4 addresses from your messages or the previous checkpoint are protected. Any the summary dropped are appended verbatim under `### Retained Identifiers`.
 - **File and worktree state.** Files the session read or changed through tools, the files git reports as dirty, lockfile and generated-asset changes, and a bounded diff of uncommitted work, including previews of untracked files. Untracked symlinks are never followed.
 
-On the next compaction, the previous checkpoint goes back to the model as `<previous-summary>` and is merged with the new turns. The appended state is regenerated each time rather than carried forward.
+On the next compaction, the previous checkpoint goes back to the model as `<previous-summary>` and is merged with the new turns. The appended state is regenerated each time.
+
+OpenCode still keeps the most recent conversation (`compaction.keep.tokens`) verbatim beside the checkpoint.
 
 ## Install
 
-Add the package to the `plugin` list in `~/.config/opencode/opencode.json` (or a project's `opencode.json`):
+Add the package to `plugins` in `~/.config/opencode/opencode.json` or a project's `opencode.json`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-smart-compaction"]
+  "plugins": ["opencode-smart-compaction"]
 }
 ```
 
-OpenCode installs the package the next time it starts. The plugin targets the OpenCode 1 plugin API (`opencode-ai` 1.18 or later).
+OpenCode installs it from npm on the next start. It needs OpenCode 2.0.26 or later.
 
 ## Configure
 
-The plugin has no options of its own. Compaction is configured in OpenCode:
+The plugin has no options. Compaction itself is configured in OpenCode:
 
-- **Compaction model.** Set `agent.compaction.model` to summarize with a different model than the session's:
+- `compaction.auto` (default `true`) and `compaction.buffer` decide when automatic compaction runs; `/compact` runs it on demand.
+- `compaction.keep.tokens` (default `15000`) sets how much recent conversation stays verbatim beside the checkpoint.
 
-  ```json
-  {
-    "agent": { "compaction": { "model": "provider/model-id" } }
-  }
-  ```
-
-- **When it runs.** `compaction.auto` (default `true`) and `compaction.reserved` control automatic compaction; `/compact` runs it on demand. Leave `compaction.prune` off unless old tool output becomes a problem, because the checkpoint already records file state.
+The checkpoint is written by the session's model. Models set to provider-native compaction (`settings.compaction.type: "native"`) don't call the hook, so the plugin doesn't apply to them.
 
 ## Limits
 
-- **No retry or fallback model.** OpenCode runs the compaction request itself, so a summary that comes back incomplete is kept as written. Pi's Smart Compaction can reject it and retry on another model.
-- **Experimental hooks.** The plugin relies on `experimental.session.compacting` and `experimental.text.complete`. If an OpenCode release changes them, the plugin logs a warning and OpenCode's own prompt is used instead; sessions never block on the plugin.
-- **One text part.** The state is appended to the first text part of the summary message, which is the only one compaction models normally produce.
+- **No validation retry.** A summary that comes back incomplete is kept as written. Pi's Smart Compaction can reject it and retry on another model.
+- **Fails open.** If the plugin can't build or generate a checkpoint, it logs a warning and OpenCode compacts with its own prompt. A session never blocks on the plugin.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md): the hooks, the session read, and how the summary is completed.
+- [Architecture](docs/ARCHITECTURE.md): the hook, the request it builds, and how the summary is completed.
 - [Development](docs/DEVELOPMENT.md): commands, tests, and releases.
 
 ## License

@@ -6,61 +6,91 @@ import * as path from "node:path";
 import test from "node:test";
 import { buildCheckpoint, completeSummary, RETAINED_IDENTIFIERS_HEADING, semanticSummary } from "../src/checkpoint.ts";
 import { getGitEngineeringState } from "../src/git-state.ts";
-import { readSessionFacts, type SessionEntry } from "../src/session.ts";
+import { readSessionFacts, TOOL_OUTPUT_MAX_CHARS } from "../src/session.ts";
 import plugin from "../src/index.ts";
 
 const SHA = "1234567890abcdef1234567890abcdef12345678";
 const noGit = { available: false, files: [], patch: "", lockfilesAndGeneratedAssets: [] };
+const open = (name: string) => `<${name}>`;
+const close = (name: string) => `</${name}>`;
+const TOUCHED = "touched-files";
 
-const user = (text: string, synthetic = false): SessionEntry => ({ info: { role: "user" }, parts: [{ type: "text", text, synthetic }] });
-const tool = (name: string, input: Record<string, unknown>, status = "completed"): SessionEntry => ({
-  info: { role: "assistant" },
-  parts: [{ type: "tool", tool: name, state: { status, input } }],
+type Messages = Parameters<typeof readSessionFacts>[0];
+const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+const call = (id: string, name: string, input: Record<string, unknown>) => ({
+  role: "assistant",
+  content: [{ type: "tool-call", id, name, input }],
 });
-const summary = (text: string): SessionEntry => ({ info: { role: "assistant", summary: true }, parts: [{ type: "text", text }] });
+const result = (id: string, name: string, value: string, type = "text") => ({
+  role: "tool",
+  content: [{ type: "tool-result", id, name, result: { type, value } }],
+});
+const checkpointMessage = (summary: string) =>
+  user(
+    [
+      open("conversation-checkpoint"),
+      "The following is a summary and serialized record of earlier conversation.",
+      "",
+      `${open("summary")}\n${summary}\n${close("summary")}`,
+      close("conversation-checkpoint"),
+    ].join("\n"),
+  );
 
-test("session facts keep user words, the latest checkpoint, and files touched by tools", () => {
+test("session facts keep user words, the previous checkpoint, files touched by tools, and a bounded transcript", () => {
   const facts = readSessionFacts([
+    checkpointMessage("latest checkpoint"),
     user(`Deploy ${SHA} to https://example.com/api`),
-    user("Continue if you have next steps", true),
-    tool("read", { filePath: "/repo/src/a.ts" }),
-    tool("read", { filePath: "/repo/src/b.ts" }),
-    tool("edit", { filePath: "/repo/src/b.ts" }),
-    tool("write", { filePath: "/repo/src/c.ts" }, "error"),
-    tool("apply_patch", { patchText: "*** Begin Patch\n*** Add File: src/new.ts\n+x\n*** Update File: src/old.ts\n*** Move to: src/moved.ts\n*** End Patch" }),
-    summary("first checkpoint"),
-    summary("latest checkpoint"),
-  ]);
+    call("1", "read", { path: "/repo/src/a.ts" }),
+    result("1", "read", "x".repeat(TOOL_OUTPUT_MAX_CHARS + 10)),
+    call("2", "read", { path: "/repo/src/b.ts" }),
+    call("3", "edit", { path: "/repo/src/b.ts" }),
+    call("4", "write", { path: "/repo/src/c.ts" }),
+    result("4", "write", "denied", "error"),
+    call("5", "patch", { patchText: "*** Begin Patch\n*** Add File: src/new.ts\n+x\n*** Update File: src/old.ts\n*** Move to: src/moved.ts\n*** End Patch" }),
+  ] as unknown as Messages);
   assert.deepEqual(facts.userTexts, [`Deploy ${SHA} to https://example.com/api`]);
   assert.equal(facts.previousSummary, "latest checkpoint");
   assert.deepEqual(facts.readFiles, ["/repo/src/a.ts"]);
   assert.deepEqual(facts.modifiedFiles, ["/repo/src/b.ts", "src/moved.ts", "src/new.ts", "src/old.ts"]);
+  assert.match(facts.transcript, /\[User\]: Deploy/);
+  assert.match(facts.transcript, /\[Assistant tool call\]: read\(\{"path":"\/repo\/src\/a\.ts"\}\)/);
+  assert.match(facts.transcript, /\n\[truncated\]/);
+  assert.match(facts.transcript, /\[Tool error\]: denied/);
+  assert.ok(!facts.transcript.includes("latest checkpoint"), "the previous checkpoint is carried separately");
 });
 
-test("the prompt carries the previous checkpoint and protected facts, without regenerated state", () => {
-  const previous = `## 1. Primary Goal & Nuanced Intent\n- keep ${SHA}\n\n<touched-files>\nold.ts\n</touched-files>`;
+test("the prompt carries the conversation, previous checkpoint, and protected facts, without regenerated state", () => {
+  const previous = `## 1. Primary Goal & Nuanced Intent\n- keep ${SHA}\n\n${open(TOUCHED)}\nold.ts\n${close(TOUCHED)}`;
   const checkpoint = buildCheckpoint(
-    { userTexts: ["Use https://example.com/v1 and 10.0.0.5"], previousSummary: previous, readFiles: [], modifiedFiles: ["src/x.ts"] },
+    {
+      userTexts: ["Use https://example.com/v1 and 10.0.0.5"],
+      previousSummary: previous,
+      readFiles: [],
+      modifiedFiles: ["src/x.ts"],
+      transcript: "[User]: Use https://example.com/v1 and 10.0.0.5",
+    },
     noGit,
   );
   assert.match(checkpoint.prompt, /high-fidelity context continuity synthesizer/);
-  assert.match(checkpoint.prompt, /<previous-summary>\n## 1\. Primary Goal/);
+  assert.ok(checkpoint.prompt.includes(`${open("conversation")}\n[User]: Use https://example.com/v1`));
+  assert.ok(checkpoint.prompt.includes(`${open("previous-summary")}\n## 1. Primary Goal`));
   assert.doesNotMatch(checkpoint.prompt, /old\.ts/, "regenerated state is not fed back");
-  assert.match(checkpoint.prompt, /The conversation history below contains NEW conversation turns/);
+  assert.ok(checkpoint.prompt.includes(`The ${open("conversation")} tags above contain NEW conversation turns`));
   assert.deepEqual(checkpoint.protectedFacts.sort(), ["10.0.0.5", SHA, "https://example.com/v1"].sort());
-  assert.match(checkpoint.appendix, /<touched-files>\nsrc\/x\.ts\n<\/touched-files>/);
-  assert.match(checkpoint.appendix, /<uncommitted-state-unavailable/);
+  assert.ok(checkpoint.appendix.includes(`${open(TOUCHED)}\nsrc/x.ts\n${close(TOUCHED)}`));
+  assert.ok(checkpoint.appendix.includes("<uncommitted-state-unavailable"));
 
-  const first = buildCheckpoint({ userTexts: ["start"], readFiles: [], modifiedFiles: [] }, noGit);
-  assert.match(first.prompt, /in the conversation history below/);
-  assert.doesNotMatch(first.prompt, /<previous-summary>/);
+  const first = buildCheckpoint({ userTexts: ["start"], readFiles: [], modifiedFiles: [], transcript: "[User]: start" }, noGit);
+  assert.ok(first.prompt.includes(`in the ${open("conversation")} tags above`));
+  assert.ok(!first.prompt.includes(open("previous-summary")));
 });
 
 test("a finished summary gets dropped identifiers back verbatim and the exact file state", () => {
-  const done = completeSummary("## 1. Primary Goal\nwork on kept\n", { protectedFacts: [SHA, "kept"], appendix: "\n\n<touched-files>\na.ts\n</touched-files>" });
-  assert.match(done, new RegExp(`${RETAINED_IDENTIFIERS_HEADING}\n- ${SHA}\n\n<touched-files>`));
+  const appendix = `\n\n${open(TOUCHED)}\na.ts\n${close(TOUCHED)}`;
+  const done = completeSummary("## 1. Primary Goal\nwork on kept\n", { protectedFacts: [SHA, "kept"], appendix });
+  assert.ok(done.includes(`${RETAINED_IDENTIFIERS_HEADING}\n- ${SHA}\n\n${open(TOUCHED)}`));
   assert.ok(!done.includes("- kept"), "facts already present are not repeated");
-  assert.equal(semanticSummary(done).includes("<touched-files>"), false);
+  assert.equal(semanticSummary(done).includes(open(TOUCHED)), false);
   assert.equal(completeSummary(`has ${SHA}`, { protectedFacts: [SHA], appendix: "" }), `has ${SHA}`);
 });
 
@@ -91,43 +121,62 @@ test("git state covers tracked diffs and bounded untracked previews, never follo
   assert.equal((await getGitEngineeringState(os.tmpdir())).available, false);
 });
 
-test("the plugin replaces the prompt and completes only the compaction summary", async () => {
-  const messages: SessionEntry[] = [user(`Ship ${SHA}`), tool("edit", { filePath: "src/app.ts" })];
-  const client = {
+type CompactionHook = (event: Record<string, unknown>) => Promise<void>;
+
+async function load(generate: (input: { prompt: string; model: unknown }) => Promise<{ text: string }>) {
+  let hook: CompactionHook | undefined;
+  const ctx = {
+    location: { directory: os.tmpdir() },
     session: {
-      messages: async () => ({ data: messages }),
-      message: async ({ path: p }: { path: { messageID: string } }) => ({ data: { info: { summary: p.messageID === "summary-1" } } }),
+      hook: async (name: string, callback: CompactionHook) => {
+        assert.equal(name, "compaction");
+        hook = callback;
+        return { dispose: async () => {} };
+      },
+      get: async () => ({ location: { directory: os.tmpdir() } }),
     },
-    app: { log: async () => ({}) },
+    generate: { text: generate },
   };
-  assert.equal(plugin.id, "opencode-smart-compaction");
-  const hooks = await plugin.server({ client, directory: os.tmpdir(), worktree: os.tmpdir() } as never);
+  await plugin.setup(ctx as never);
+  assert.ok(hook, "the plugin registers a compaction hook");
+  return hook;
+}
 
-  const output = { context: [] as string[], prompt: undefined as string | undefined };
-  await hooks["experimental.session.compacting"]!({ sessionID: "s1" }, output);
-  assert.match(output.prompt ?? "", /## 6\. Resume Anchor/);
-
-  const other = { text: "regular reply" };
-  await hooks["experimental.text.complete"]!({ sessionID: "s1", messageID: "reply-1", partID: "p" }, other);
-  assert.equal(other.text, "regular reply", "non-summary text is untouched");
-
-  const written = { text: "## 1. Primary Goal\nship it" };
-  await hooks["experimental.text.complete"]!({ sessionID: "s1", messageID: "summary-1", partID: "p" }, written);
-  assert.match(written.text, new RegExp(`- ${SHA}`));
-  assert.match(written.text, /<touched-files>\nsrc\/app\.ts\n<\/touched-files>/);
-
-  const again = { text: "later summary" };
-  await hooks["experimental.text.complete"]!({ sessionID: "s1", messageID: "summary-1", partID: "p" }, again);
-  assert.equal(again.text, "later summary", "a checkpoint completes one summary only");
+const compactionEvent = () => ({
+  sessionID: "ses_1",
+  model: { providerID: "cliproxy", id: "factory/claude-opus-5-5" },
+  messages: [user(`Ship ${SHA}`), call("1", "edit", { path: "src/app.ts" })],
+  result: undefined as { summary: string } | undefined,
 });
 
-test("a failing session read leaves OpenCode's own prompt in place", async () => {
-  const client = {
-    session: { messages: async () => { throw new Error("offline"); }, message: async () => ({ data: undefined }) },
-    app: { log: async () => ({}) },
-  };
-  const hooks = await plugin.server({ client, directory: os.tmpdir(), worktree: os.tmpdir() } as never);
-  const output = { context: [] as string[], prompt: undefined as string | undefined };
-  await hooks["experimental.session.compacting"]!({ sessionID: "s1" }, output);
-  assert.equal(output.prompt, undefined);
+test("the compaction hook writes the checkpoint with the session's model and completes it", async () => {
+  let request: { prompt: string; model: unknown } | undefined;
+  const hook = await load(async (input) => {
+    request = input;
+    return { text: "## 1. Primary Goal\nship it" };
+  });
+  assert.equal(plugin.id, "opencode-smart-compaction");
+
+  const event = compactionEvent();
+  await hook(event);
+  assert.deepEqual(request?.model, event.model);
+  assert.match(request?.prompt ?? "", /## 6\. Resume Anchor/);
+  assert.ok(request?.prompt.includes(`[User]: Ship ${SHA}`));
+  assert.ok(event.result?.summary.startsWith("## 1. Primary Goal\nship it"));
+  assert.ok(event.result?.summary.includes(`- ${SHA}`));
+  assert.ok(event.result?.summary.includes(`${open(TOUCHED)}\nsrc/app.ts\n${close(TOUCHED)}`));
+});
+
+test("a failed or empty generation leaves OpenCode's own compaction in place", async () => {
+  const failing = await load(async () => {
+    throw new Error("offline");
+  });
+  const failed = compactionEvent();
+  await failing(failed);
+  assert.equal(failed.result, undefined);
+
+  const empty = await load(async () => ({ text: "  " }));
+  const blank = compactionEvent();
+  await empty(blank);
+  assert.equal(blank.result, undefined);
 });

@@ -2,7 +2,7 @@
 
 ## Project
 
-An OpenCode 1 plugin, published to npm as `opencode-smart-compaction`, that replaces OpenCode's compaction prompt with the Smart Compaction checkpoint and completes the summary afterwards. See `docs/ARCHITECTURE.md` before changing hook behavior.
+An OpenCode 2 plugin, published to npm as `opencode-smart-compaction`, that writes compaction checkpoints in the Smart Compaction format through the session `compaction` hook. Read `docs/ARCHITECTURE.md` before changing hook behavior.
 
 ## Commands
 
@@ -11,11 +11,12 @@ An OpenCode 1 plugin, published to npm as `opencode-smart-compaction`, that repl
 
 ## Critical patterns
 
-- Keep `main` and `exports["./server"]` in `package.json` pointing at `src/index.ts`. OpenCode ignores `exports["."]`, and without them it skips the plugin silently.
-- `src/index.ts` default-exports `{ id, server }` and nothing else, because OpenCode's legacy loader calls every exported function as a plugin.
-- Both hooks fail open: catch errors, log through `client.app.log`, and leave OpenCode's own behavior in place.
+- Target the OpenCode 2 plugin API only (`{ id, setup }`); do not add a V1 `server()` entrypoint.
+- Import only types from `@opencode/plugin`. It stays a dev and optional peer dependency, never a runtime dependency.
+- The hook fails open: on any error or empty reply, leave `event.result` unset so OpenCode compacts with its own prompt.
 - `src/prompt.ts` and `src/git-state.ts` mirror the Pi extension (`shariq-pi-extensions/extensions/smart-compaction`). A change to the checkpoint format or protected-fact rules belongs in both.
 - Prompt strings contain literal XML-style tags. Verify them with `grep` on the file, since some editing tools hide them in their display.
+- Test live against the published npm package, not a local path.
 
 ## Releases
 

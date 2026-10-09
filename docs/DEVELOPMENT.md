@@ -11,22 +11,28 @@ The toolchain is pinned in `mise.toml`, Bun manages dependencies through `bun.lo
 
 ## Test against a live OpenCode
 
-Point the `plugin` list at the checkout and restart OpenCode:
+Test the published package. With `"plugins": ["opencode-smart-compaction"]` in the config, confirm the plugin is active:
 
-```json
-{ "plugin": ["file:///absolute/path/to/opencode-smart-compaction"] }
+```bash
+opencode api get /api/plugin
 ```
 
-Compact a session with `/compact` (or `POST /session/:id/summarize` on `opencode serve`), then check the latest `summary: true` message: it should have the six numbered sections, any retained identifiers, and the file-state blocks at the end.
+Compact a session that has at least two exchanges:
+
+```bash
+opencode api post /api/session/<session-id>/compact --data '{}'
+```
+
+Then read the session's messages (`opencode api get /api/session/<session-id>/message`). The completed `compaction` message should have the six numbered sections, any retained identifiers, and the file-state blocks at the end.
 
 ## Releases
 
 Pushing to `main` runs CI (`.github/workflows/ci.yml`). The publish workflow (`.github/workflows/publish-npm.yml`) validates and publishes to npm with provenance whenever `package.json` carries a version that isn't on npm yet, so bump `version` with every functional change.
 
-Publishing uses npm trusted publishing (OIDC): the repository holds no npm token. The package's trusted publisher on npmjs.com must name this repository and `publish-npm.yml`; renaming the workflow file breaks publishing until the npm setting is updated.
+Publishing uses npm trusted publishing (OIDC), so the repository holds no npm token. The package's trusted publisher on npmjs.com names this repository and `publish-npm.yml`; renaming the workflow file breaks publishing until that setting is updated.
 
 ## Upgrading OpenCode
 
-1. Raise `@opencode-ai/plugin` in `devDependencies` and run `bun install`.
-2. Check that the hook signatures in `node_modules/@opencode-ai/plugin/src/index.ts` still match what `src/index.ts` uses, since the hooks are experimental.
-3. Run `validate`, then repeat the live test above.
+1. Raise `@opencode/plugin` in `devDependencies` and the `peerDependencies` floor, then run `bun install`.
+2. Check `node_modules/@opencode/plugin/dist/promise/session.d.ts` for changes to the `compaction` hook event, and the OpenCode compaction source for changes to how the previous checkpoint is wrapped.
+3. Run `validate`, publish, and repeat the live test above.
