@@ -204,6 +204,7 @@ test("git state covers tracked diffs and bounded untracked previews, never follo
     fs.writeFileSync(path.join(root, "tracked.ts"), "export const v = 1;\n");
     git("add", "tracked.ts");
     git("commit", "-qm", "init");
+    assert.equal((await getGitEngineeringState(root)).patch, "", "a clean worktree gets no empty diff block");
     fs.writeFileSync(path.join(root, "tracked.ts"), "export const v = 2;\n");
     fs.writeFileSync(path.join(root, "fresh.ts"), "export const fresh = true;\n");
     fs.writeFileSync(outside, "OUTSIDE-SECRET\n");
