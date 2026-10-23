@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin";
 import { cacheReusePlan, createCacheTracker } from "./cache.ts";
-import { buildCheckpoint, completeSummary, isCompleteSummary } from "./checkpoint.ts";
+import { buildCheckpoint, completeSummary, isCompleteSummary, stripAppendedState } from "./checkpoint.ts";
 import { subscribe } from "./events.ts";
 import { getGitEngineeringState } from "./git-state.ts";
 import { createModelLimits, modelKey, modelLabel, type ModelRef } from "./model-limits.ts";
@@ -77,7 +77,7 @@ export default {
     const cacheReuse = ctx.options.cacheReuse !== false;
     const cache = createCacheTracker();
     const limits = createModelLimits(ctx);
-    const inFlight = new Map<string, number>();
+    const inFlight = new Map<string, { maxTokens: number; prompt: string; model: string }>();
 
     await ctx.session.hook("compaction", async (event) => {
       if (event.result) return;
@@ -119,7 +119,7 @@ export default {
           const label = modelLabel(model);
           try {
             const { text } = await generate();
-            const outcome = isCompleteSummary(text) ? "ok" : text.trim() ? "incomplete" : "empty";
+            const outcome = isCompleteSummary(stripAppendedState(text)) ? "ok" : text.trim() ? "incomplete" : "empty";
             attempts.push({ mode, model: label, ms: Date.now() - start, outcome });
             if (outcome !== "ok") return false;
             const summary = completeSummary(text, {
@@ -145,11 +145,12 @@ export default {
         };
         if (typeof plan !== "string") {
           if (await attempt("cached", event.model, checkpoint.cachedPrompt, async () => {
-            inFlight.set(event.sessionID, plan.maxTokens);
+            const request = { maxTokens: plan.maxTokens, prompt: checkpoint.cachedPrompt, model: modelLabel(event.model) };
+            inFlight.set(event.sessionID, request);
             try {
               return await ctx.session.generate({ sessionID: event.sessionID, prompt: checkpoint.cachedPrompt });
             } finally {
-              inFlight.delete(event.sessionID);
+              if (inFlight.get(event.sessionID) === request) inFlight.delete(event.sessionID);
             }
           })) return;
         }
@@ -170,8 +171,12 @@ export default {
     if (maxRecentTokens > 0 || cacheReuse) {
       await ctx.session.hook("generate", (event) => {
         if (maxRecentTokens > 0) trimRecentContext(event.messages, maxRecentTokens);
-        const maxTokens = inFlight.get(event.sessionID);
-        if (maxTokens !== undefined) event.options.maxTokens = Math.min(event.options.maxTokens ?? maxTokens, maxTokens);
+        const request = inFlight.get(event.sessionID);
+        const last = event.messages.at(-1);
+        const part = last?.content[0];
+        if (!request || last?.role !== "user" || last.content.length !== 1 || part?.type !== "text" || part.text !== request.prompt) return;
+        if (modelLabel(event.model) !== request.model) throw new Error("session model changed since the cached-path check");
+        event.options.maxTokens = Math.min(event.options.maxTokens ?? request.maxTokens, request.maxTokens);
       });
     }
 

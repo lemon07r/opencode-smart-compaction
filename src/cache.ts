@@ -8,6 +8,7 @@ export interface CachedStep {
   model: string;
   /** When the step's request was sent, which is when the provider last used the cache. */
   startedAt: number;
+  assistantMessageID: string;
   tokens: TokenUsage;
 }
 
@@ -24,7 +25,7 @@ export function createCacheTracker() {
           break;
         case "session.step.ended": {
           const step = started.get(event.data.sessionID);
-          if (step) steps.set(event.data.sessionID, { ...step, tokens: event.data.tokens });
+          if (step) steps.set(event.data.sessionID, { ...step, assistantMessageID: event.data.assistantMessageID, tokens: event.data.tokens });
           else steps.delete(event.data.sessionID);
           break;
         }
@@ -61,7 +62,20 @@ export function cacheReusePlan(input: {
   if (step.tokens.cache.read + step.tokens.cache.write <= 0) return "cache-cold";
   const window = limits?.context || limits?.input || 0;
   if (window <= 0) return "unknown-model-window";
-  const room = window - contextTokens(step.tokens) - Math.ceil(prompt.length / 4) - 8_000;
+  const index = context.findIndex((message) => message.id === step.assistantMessageID);
+  const assistant = context[index];
+  if (!assistant || assistant.type !== "assistant") return "step-not-in-context";
+  const chars = (value: unknown) => JSON.stringify(value)?.length ?? 0;
+  let pendingChars = 0;
+  for (const part of assistant.content) {
+    if (part.type !== "tool") continue;
+    if (part.state.status === "completed" || part.state.status === "error") pendingChars += chars(part.state.content);
+    if (part.state.status === "error") pendingChars += chars(part.state.error);
+  }
+  for (const message of context.slice(index + 1)) pendingChars += chars(message);
+  const projected = contextTokens(step.tokens) + Math.ceil(pendingChars / 4) + Math.ceil(prompt.length / 4);
+  if (limits?.input && limits.input > 0 && projected + 8_000 > limits.input) return "insufficient-room";
+  const room = window - projected - 8_000;
   if (room < 4_096) return "insufficient-room";
   return { maxTokens: Math.min(32_000, limits?.output && limits.output > 0 ? limits.output : 32_000, room) };
 }

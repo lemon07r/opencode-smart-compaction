@@ -66,7 +66,7 @@ const APPENDED_START = new RegExp(`\\n\\n<(?:${APPENDED_STATE.join("|")})\\b`, "
 
 /** Remove only whole reserved blocks outside fenced examples; inline mentions are ordinary prose. */
 export function stripAppendedState(text: string): string {
-  const block = new RegExp(`^[ \\t]*<(${APPENDED_STATE.join("|")})(?=[\\s/>])[^>\\r\\n]*?(?:/[ \\t]*>|>[\\s\\S]*?</\\1[ \\t]*>)[ \\t]*\\r?$`, "gim");
+  const block = new RegExp(`^<(${APPENDED_STATE.join("|")})(?=[\\s/>])[^>\\r\\n]*?(?:/[ \\t]*>|>[\\s\\S]*?</\\1[ \\t]*>)[ \\t]*\\r?$`, "gim");
   const output: string[] = [];
   let plain: string[] = [];
   let fence: string | undefined;
@@ -86,6 +86,7 @@ export function stripAppendedState(text: string): string {
     } else plain.push(line);
   }
   flush();
+  if (fence) output.push(fence);
   return output.join("\n").trimEnd();
 }
 

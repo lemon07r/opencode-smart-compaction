@@ -100,7 +100,7 @@ OpenCode's own automatic compaction still runs at the model window minus `compac
 - `compaction.auto` (default `true`) turns OpenCode's automatic compaction and overflow recovery on or off; `/compact` runs it on demand.
 - `compaction.keep.tokens` (default `15000`) sets OpenCode's target for recent conversation kept verbatim beside the checkpoint; its user-turn boundary can make the actual amount larger. `maxRecentTokens` is the plugin's separate request-side ceiling.
 
-The checkpoint is written by the session's model with its selected variant, so reasoning settings carry over. To use another model, set `agents.compaction.model` (for example `"provider/model#variant"`); that model always takes the stateless path, since it has no warm cache. Models set to provider-native compaction (`settings.compaction.type: "native"`) don't call the hook, so the checkpoint format doesn't apply to them; the threshold still does.
+The checkpoint is written by the session's model with its selected variant, so reasoning settings carry over. To use another model, set `agents.compaction.model` (for example `"provider/model#variant"`); that model always takes the stateless path, since it has no warm cache. Models set to provider-native compaction (`settings.compaction.type: "native"`) still call the hook (checked in OpenCode 2.0.26 and 2.1.3), so the plugin's checkpoint replaces the native one.
 
 ### Other plugins and the cache
 
