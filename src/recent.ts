@@ -3,7 +3,7 @@
  *
  * OpenCode keeps the newest `compaction.keep.tokens` of the session, but moves the boundary back to the latest user
  * message, so after a long autonomous run the kept turns can be most of the window. The compaction hook summarizes
- * those turns too (`keptMessages`, `asTranscriptMessages`) and marks the checkpoint; the `context` hook then keeps
+ * those turns too (`keptMessages`, `adaptKeptMessages`) and marks the checkpoint; the `context` hook then keeps
  * only the newest part of a marked checkpoint's recent context in each request (`trimRecentContext`). Stored
  * messages are never changed, so the next compaction still reads the whole recent context.
  */
@@ -52,48 +52,14 @@ export function keptMessages(summarized: readonly Message[], context: readonly C
   return undefined;
 }
 
-/** Whether every content-bearing kept turn is adapted, so trimming it after summarization is safe. */
-export function canSummarizeKept(stored: readonly ContextMessage[]): boolean {
-  return stored.every((message) => {
-    switch (message.type) {
-      case "skill":
-      case "system":
-      case "shell":
-      case "synthetic":
-      case "idle":
-        return true;
-      case "compaction":
-        // Manual compaction stores its empty running placeholder before invoking the hook. It isn't conversation.
-        // Failed earlier attempts carry an error that the adapter includes; completed checkpoints still need a boundary.
-        return message.status === "failed" || (message.status === "running" && !message.summary.trim() && !message.recent.trim());
-      case "user":
-        return !message.files?.length && !message.agents?.length && !message.skills?.length;
-      case "assistant":
-        return message.content.every((part) => {
-          if (part.type === "text" || part.type === "reasoning") return true;
-          if (part.type !== "tool") return false;
-          switch (part.state.status) {
-            case "running":
-              return true;
-            case "completed":
-            case "error":
-              return part.state.content?.every((item) => item.type === "text") ?? true;
-            default:
-              return false;
-          }
-        });
-      default:
-        return false;
-    }
-  });
-}
-
-/** Stored messages in the request-message shape `readSessionFacts` reads: user text, assistant parts, tool results. */
-export function asTranscriptMessages(stored: readonly ContextMessage[]): Message[] {
+/** Adapt stored turns for `readSessionFacts`, tracking whether every content-bearing part is covered. */
+export function adaptKeptMessages(stored: readonly ContextMessage[]): { messages: Message[]; complete: boolean } {
+  let complete = true;
   const text = (role: "user" | "assistant", value: string) => ({ role, content: [{ type: "text", text: value }] });
-  return stored.flatMap((message): unknown[] => {
+  const messages = stored.flatMap((message): unknown[] => {
     switch (message.type) {
       case "user":
+        if (message.files?.length || message.agents?.length || message.skills?.length) complete = false;
         return message.text.trim() ? [text("user", message.text)] : [];
       case "synthetic": {
         const source = typeof message.metadata?.source === "string" ? ` (source: ${message.metadata.source})` : "";
@@ -104,6 +70,9 @@ export function asTranscriptMessages(stored: readonly ContextMessage[]): Message
       case "system":
         return message.text.trim() ? [text("assistant", `[Historical system context]: ${message.text}`)] : [];
       case "compaction":
+        // The current empty manual-compaction placeholder isn't conversation. Failed attempts carry an error;
+        // completed checkpoints still need a boundary before their content can be covered.
+        if (message.status !== "failed" && !(message.status === "running" && !message.summary.trim() && !message.recent.trim())) complete = false;
         return message.status === "failed"
           ? [text("assistant", `[Historical compaction failure]: ${message.error.type}: ${truncateHeadAndTail(message.error.message, 1_500, 1_500)}`)]
           : [];
@@ -126,7 +95,14 @@ export function asTranscriptMessages(stored: readonly ContextMessage[]): Message
             if (part.text) content.push({ type: part.type, text: part.text });
             continue;
           }
-          if (part.type !== "tool" || part.state.status === "streaming") continue;
+          if (part.type !== "tool" || part.state.status === "streaming") {
+            complete = false;
+            continue;
+          }
+          if (part.state.status !== "running") {
+            if (part.state.status !== "completed" && part.state.status !== "error") complete = false;
+            else if (part.state.content?.some((item) => item.type !== "text")) complete = false;
+          }
           content.push({ type: "tool-call", id: part.id, name: part.name, input: part.state.input });
           if (part.state.status === "running") {
             content.push({ type: "text", text: `[Tool status: ${part.name} (${part.id})]: running` });
@@ -141,10 +117,14 @@ export function asTranscriptMessages(stored: readonly ContextMessage[]): Message
         }
         return content.length > 0 ? [{ role: "assistant", content }, ...results] : results;
       }
+      case "idle":
+        return [];
       default:
+        complete = false;
         return [];
     }
   }) as Message[];
+  return { messages, complete };
 }
 
 /** The newest part of a serialized recent context that fits `maxChars`, starting at a turn, or undefined if it fits. */

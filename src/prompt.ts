@@ -106,6 +106,11 @@ export const RECENT_SUMMARIZED_NOTE =
 export const RUNNING_SUBAGENTS_NOTE =
   "Background subagents still running; each reports back automatically when it finishes. Do not poll, relaunch, or duplicate their work.";
 
+export const UNVERIFIED_SUBAGENTS_NOTE =
+  "Previously recorded background subagents; their current status is unverified because session context could not be read. Check for completion reports before deciding whether to resume or relaunch them.";
+
+const MAX_STATE_FILES = 60;
+
 export function escapeXml(text: string): string {
   return text
     .replace(/&/g, "&amp;")
@@ -124,23 +129,28 @@ export function sanitizeTagContent(text: string): string {
 }
 
 function cleanExtractedUrl(rawUrl: string): string {
-  // Strip trailing punctuation often attached in prose or markdown (e.g. `url`, `url`,)
-  return rawUrl.replace(/[`'",.;:!?)\]]+$/, "");
+  // A markdown/prose closer ends the URL even when emphasis or other text follows it.
+  let depth = 0;
+  let end = rawUrl.length;
+  for (let index = 0; index < rawUrl.length; index++) {
+    if (rawUrl[index] === "(") depth++;
+    else if (rawUrl[index] === ")" && --depth < 0) {
+      end = index;
+      break;
+    }
+  }
+  return rawUrl.slice(0, end).replace(/[`'",.;:!?\]]+$/, "");
 }
 
+/** Identifiers from user text and the caller's already-stripped semantic summary. */
 export function extractProtectedFacts(userTexts: readonly string[], previousSummary?: string): string[] {
   const facts = new Set<string>();
-  const userSources = [...userTexts];
-  const identifierSources = [...userSources];
-  if (previousSummary) {
-    const semanticSummary = previousSummary.split(/\n\n<(?:read-files|touched-files|uncommitted-dirty-files|modified-lockfiles-and-assets|active-background-processes|running-subagents|uncommitted-diff|recent-context-summarized)>/i)[0];
-    identifierSources.push(semanticSummary);
-  }
+  const identifierSources = previousSummary ? [...userTexts, previousSummary] : userTexts;
 
   const identifierPatterns = [
     /\b[0-9a-f]{40}\b/gi,
     /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,
-    /https?:\/\/[^\s<>"')\]]+/gi,
+    /https?:\/\/[^\s<>"'\]]+/gi,
     /\b(?:\d{1,3}\.){3}\d{1,3}\b/g,
   ];
 
@@ -163,6 +173,7 @@ export function formatFileOperationsXml(options?: {
   dirtyStateAvailable?: boolean;
   activeBackgroundProcesses?: Iterable<string>;
   runningSubagents?: Iterable<string>;
+  subagentsVerified?: boolean;
   lockfilesAndGeneratedAssets?: Iterable<string>;
   recentSummarized?: boolean;
 }): string {
@@ -179,6 +190,10 @@ export function formatFileOperationsXml(options?: {
   const dirty = [...dirtySet].sort();
   const background = [...backgroundSet].sort();
   const lockfiles = [...lockfilesSet].sort();
+  const boundedFiles = (files: string[]) => [
+    ...files.slice(0, MAX_STATE_FILES).map(escapeXml),
+    ...(files.length > MAX_STATE_FILES ? [`… ${files.length - MAX_STATE_FILES} more omitted`] : []),
+  ].join("\n");
 
   const sections: string[] = [];
   if (readOnly.length > 0) {
@@ -188,17 +203,18 @@ export function formatFileOperationsXml(options?: {
     sections.push(`<touched-files>\n${touched.map(escapeXml).join("\n")}\n</touched-files>`);
   }
   if (dirty.length > 0) {
-    sections.push(`<uncommitted-dirty-files>\n${dirty.map(escapeXml).join("\n")}\n</uncommitted-dirty-files>`);
+    sections.push(`<uncommitted-dirty-files>\n${boundedFiles(dirty)}\n</uncommitted-dirty-files>`);
   }
   if (lockfiles.length > 0) {
-    sections.push(`<modified-lockfiles-and-assets>\n${lockfiles.map(escapeXml).join("\n")}\n</modified-lockfiles-and-assets>`);
+    sections.push(`<modified-lockfiles-and-assets>\n${boundedFiles(lockfiles)}\n</modified-lockfiles-and-assets>`);
   }
   if (background.length > 0) {
     sections.push(`<active-background-processes>\n${background.map(escapeXml).join("\n")}\n</active-background-processes>`);
   }
   const subagents = [...(options.runningSubagents ?? [])];
   if (subagents.length > 0) {
-    sections.push(`<running-subagents>\n${[RUNNING_SUBAGENTS_NOTE, ...subagents].map(escapeXml).join("\n")}\n</running-subagents>`);
+    const note = options.subagentsVerified === false ? UNVERIFIED_SUBAGENTS_NOTE : RUNNING_SUBAGENTS_NOTE;
+    sections.push(`<running-subagents>\n${[note, ...subagents].map(escapeXml).join("\n")}\n</running-subagents>`);
   }
   if (options.dirtyPatch) {
     sections.push(`<uncommitted-diff>\n${escapeXml(options.dirtyPatch)}\n</uncommitted-diff>`);

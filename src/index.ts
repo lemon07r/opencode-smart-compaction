@@ -2,10 +2,10 @@ import type { Plugin } from "@opencode/plugin";
 import { buildCheckpoint, completeSummary, isCompleteSummary } from "./checkpoint.ts";
 import { subscribe } from "./events.ts";
 import { getGitEngineeringState } from "./git-state.ts";
-import { asTranscriptMessages, canSummarizeKept, keptMessages, readMaxRecentTokens, trimRecentContext } from "./recent.ts";
+import { adaptKeptMessages, keptMessages, readMaxRecentTokens, trimRecentContext } from "./recent.ts";
 import { readSessionFacts } from "./session.ts";
 import { createShellTracker } from "./shells.ts";
-import { carriedSubagents, formatSubagent, runningSubagents, type ContextMessage } from "./subagents.ts";
+import { carriedSubagents, carriedSubagentsVerified, formatSubagent, runningSubagents, type ContextMessage } from "./subagents.ts";
 import { createThresholdWatcher, readThresholdConfig } from "./threshold.ts";
 
 const PLUGIN_ID = "opencode-smart-compaction";
@@ -16,7 +16,7 @@ async function readContext(ctx: Pick<Plugin.Context, "session">, sessionID: stri
   try {
     return await ctx.session.context({ sessionID });
   } catch (error) {
-    warn(`session context unavailable: new subagent launches unavailable, previously recorded children retained, recent context left untrimmed: ${String(error)}`);
+    warn(`session context unavailable: new subagent launches unavailable, previously recorded children unverified, recent context left untrimmed: ${String(error)}`);
     return undefined;
   }
 }
@@ -70,14 +70,20 @@ export default {
         const context = await readContext(ctx, event.sessionID);
         // The turns OpenCode keeps verbatim are summarized too, so requests can carry only the newest of them.
         const kept = context && maxRecentTokens > 0 ? keptMessages(event.messages, context) : undefined;
-        const facts = readSessionFacts(kept ? [...event.messages, ...asTranscriptMessages(kept)] : event.messages);
+        const adapted = kept === undefined ? undefined : adaptKeptMessages(kept);
+        const facts = readSessionFacts(adapted ? [...event.messages, ...adapted.messages] : event.messages);
         if (!facts.transcript.trim()) return;
         const session = await ctx.session.get({ sessionID: event.sessionID });
         const git = await getGitEngineeringState(session.location.directory || ctx.location.directory);
+        const carriedVerified = carriedSubagentsVerified(facts.previousSummary);
         const checkpoint = buildCheckpoint(facts, git, {
           backgroundProcesses: shells.running(event.sessionID),
-          runningSubagents: runningSubagents(context ?? [], carriedSubagents(facts.previousSummary)).map(formatSubagent),
-          recentSummarized: kept !== undefined && canSummarizeKept(kept),
+          runningSubagents: runningSubagents(context ?? [], carriedSubagents(facts.previousSummary), carriedVerified ? [] : [
+            facts.transcript,
+            ...event.messages.flatMap((message) => message.content.flatMap((part) => part.type === "text" ? [part.text] : [])),
+          ], carriedVerified).map(formatSubagent),
+          subagentsVerified: context !== undefined,
+          recentSummarized: adapted?.complete === true,
         });
         let problem = "no attempt was made";
         for (const model of summaryModels(event.model, session.model)) {

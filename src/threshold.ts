@@ -59,6 +59,8 @@ export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, wa
   // left to OpenCode's own threshold until a compaction succeeds, so a failing compaction is not retried every step.
   const pending = new Set<string>();
   const failed = new Set<string>();
+  const generations = new Map<string, number>();
+  const advance = (sessionID: string) => generations.set(sessionID, (generations.get(sessionID) ?? 0) + 1);
   let windows: Promise<Map<string, number>> | undefined;
 
   const windowOf = async (model: string) => {
@@ -76,9 +78,11 @@ export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, wa
   const check = async (sessionID: string, tokens: TokenUsage) => {
     const model = models.get(sessionID);
     if (!model || pending.has(sessionID) || failed.has(sessionID)) return;
+    const generation = generations.get(sessionID) ?? 0;
     const limit = thresholdTokens(config, await windowOf(model));
     const used = contextTokens(tokens);
-    if (limit === undefined || used < limit || pending.has(sessionID)) return;
+    if (limit === undefined || used < limit || pending.has(sessionID) || failed.has(sessionID)
+      || (generations.get(sessionID) ?? 0) !== generation || models.get(sessionID) !== model) return;
     pending.add(sessionID);
     try {
       await ctx.session.compact({ sessionID });
@@ -97,16 +101,20 @@ export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, wa
         check(event.data.sessionID, event.data.tokens).catch((error) => warn(`threshold check failed: ${String(error)}`));
         break;
       case "session.compaction.started":
+        advance(event.data.sessionID);
         pending.add(event.data.sessionID);
         break;
       case "session.compaction.ended":
+        advance(event.data.sessionID);
         pending.delete(event.data.sessionID);
         failed.delete(event.data.sessionID);
         break;
       case "session.compaction.failed":
+        advance(event.data.sessionID);
         if (pending.delete(event.data.sessionID)) failed.add(event.data.sessionID);
         break;
       case "session.deleted":
+        generations.delete(event.data.sessionID);
         models.delete(event.data.sessionID);
         pending.delete(event.data.sessionID);
         failed.delete(event.data.sessionID);

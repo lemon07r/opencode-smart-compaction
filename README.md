@@ -18,11 +18,11 @@ The model writes six sections:
 The plugin then adds two things the model doesn't write:
 
 - **Retained identifiers.** Commit SHAs, UUIDs, URLs, and IPv4 addresses from your messages or the previous checkpoint are protected. Any the summary dropped are appended verbatim under `### Retained Identifiers`.
-- **File and worktree state.** Files the session read or changed through tools, accumulated across compactions and capped to the 40 read and 60 changed files used most recently; the files git reports as dirty; lockfile and generated-asset changes; background shells the session still has running, so the next turn doesn't start a duplicate dev server; background subagents that haven't reported back, so the next turn waits for them instead of polling or launching them again; and a bounded diff of uncommitted work, including previews of untracked files. Untracked symlinks are never followed.
+- **File and worktree state.** Files the session read or changed through tools, accumulated across compactions and capped to the 40 read and 60 changed files used most recently; the files git reports as dirty and lockfile/generated-asset changes (each list capped at 60, with omission counts); background shells the session still has running, so the next turn doesn't start a duplicate dev server; background subagents that haven't reported back, so the next turn waits for them instead of polling or launching them again; and a bounded diff of uncommitted work, including previews of untracked files. Untracked symlinks are never followed. If a tracked diff is too large or unavailable, its omission is noted without losing the file inventory.
 
 The conversation goes to the model in a bounded form: long tool output keeps its beginning and end, failures and the newest messages get more room, large tool arguments such as file contents are shortened, and terminal escape codes and repeated lines are removed. Session history itself is never changed.
 
-A summary is accepted only when it has all six sections. Otherwise the plugin retries the same model with its default settings (no variant), then the session's model when compaction uses a different one. Authentication, permission, and quota errors stop the retries.
+A summary is accepted only when it has all six section headings in order, outside code fences, with content after the resume heading. Otherwise the plugin retries the same model with its default settings (no variant), then the session's model when compaction uses a different one. Authentication, permission, and quota errors stop the retries.
 
 On the next compaction, the previous checkpoint goes back to the model as `<previous-summary>` and is merged with the new turns. Recent conversation from older, unmarked checkpoints is included too; recent turns already covered by a plugin checkpoint aren't summarized twice. The appended state is regenerated each time.
 
@@ -73,7 +73,7 @@ The checkpoint is written by the session's model with its selected variant, so r
 - **No timeout or thinking-off retry.** OpenCode's generation API takes only a prompt and a model, so an attempt can't be cancelled after a time limit and the retry uses the model's default settings rather than turning reasoning off.
 - **Compaction cost isn't recorded.** The same API returns no token usage, so the summary request doesn't appear in OpenCode's session cost.
 - **Background shells after a restart.** Running shells are learned from OpenCode's events, so shells started before the OpenCode service last restarted aren't listed.
-- **Conservative recent-context trimming.** Checkpoints without a reliable kept-turn boundary or with unsupported content, such as user attachments, are left untrimmed. If session context can't be read, previously recorded subagents are retained, but newly launched or completed children can't be discovered on that compaction.
+- **Conservative recent-context trimming.** Checkpoints without a reliable kept-turn boundary or with unsupported content, such as user attachments, are left untrimmed. If session context can't be read, previously recorded subagents are retained as unverified. Rendered completion tags in checkpoints and recent context clear only previously unverified carried IDs after the original records are compacted away. A verified checkpoint's running list supersedes older reports; only newer live records can end those entries.
 
 ## Documentation
 
