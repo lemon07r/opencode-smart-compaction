@@ -114,6 +114,7 @@ export default {
           prompt: checkpoint.cachedPrompt,
           now: Date.now(),
         });
+        const skipped = typeof plan === "string" ? ` cache-reuse-skipped=${plan}` : "";
         const attempt = async (mode: Mode, model: ModelRef, prompt: string, generate: () => Promise<{ text: string }>) => {
           const start = Date.now();
           const label = modelLabel(model);
@@ -135,7 +136,7 @@ export default {
                 attempts,
               } },
             };
-            console.info(`[${PLUGIN_ID}] checkpoint: mode=${mode} model=${label} attempts=${attempts.length} ${(durationMs / 1_000).toFixed(1)}s summary=${summary.length} chars`);
+            console.info(`[${PLUGIN_ID}] checkpoint: mode=${mode} model=${label} attempts=${attempts.length} ${(durationMs / 1_000).toFixed(1)}s summary=${summary.length} chars${skipped}`);
             return true;
           } catch (error) {
             attempts.push({ mode, model: label, ms: Date.now() - start, outcome: errorMessage(error) });
@@ -156,7 +157,7 @@ export default {
         for (const model of summaryModels(event.model, session.model)) {
           if (await attempt("stateless", model, checkpoint.prompt, () => ctx.generate.text({ prompt: checkpoint.prompt, model }))) return;
         }
-        warn(`using OpenCode's compaction: ${attemptList(attempts)}`);
+        warn(`using OpenCode's compaction: ${attemptList(attempts)}${skipped}`);
       } catch (error) {
         warn(`using OpenCode's compaction: ${attemptList(attempts) || errorMessage(error)}`);
       }
