@@ -510,24 +510,23 @@ const compactionEvent = () => ({
 test("cache eligibility rejects each unsafe or uneconomical path and budgets all context tokens", () => {
   const model = { providerID: "p", id: "m", variant: "high" };
   const base: Parameters<typeof cacheReusePlan>[0] = {
-    enabled: true, model, sessionModel: model, context: [], now: 1_000_000, prompt: "123456789",
-    step: { model: "p/m", startedAt: 999_999, tokens: { input: 20_000, output: 3_000, reasoning: 1_000, cache: { read: 40_000, write: 2_000 } } },
+    enabled: true, model, context: [], now: 1_000_000, prompt: "123456789",
+    step: { model: "p/m#high", startedAt: 999_999, tokens: { input: 20_000, output: 3_000, reasoning: 1_000, cache: { read: 40_000, write: 2_000 } } },
     limits: { context: 100_000, input: 50_000, output: 64_000 },
   };
   const plan = (overrides: Partial<typeof base>) => cacheReusePlan({ ...base, ...overrides });
   assert.deepEqual(plan({}), { maxTokens: 25_997 }, "context wins over input; all five token counts, ceil(prompt/4), and 8k safety count");
   for (const [overrides, reason] of [
     [{ enabled: false }, "disabled"],
-    [{ sessionModel: undefined }, "model-mismatch"],
-    [{ sessionModel: { ...model, providerID: "other" } }, "model-mismatch"],
-    [{ sessionModel: { ...model, id: "other" } }, "model-mismatch"],
-    [{ sessionModel: { ...model, variant: undefined } }, "model-mismatch"],
-    [{ sessionModel: { ...model, variant: "low" } }, "model-mismatch"],
+    [{ model: { ...model, providerID: "other" } }, "model-mismatch"],
+    [{ model: { ...model, id: "other" } }, "model-mismatch"],
+    [{ model: { ...model, variant: undefined } }, "model-mismatch"],
+    [{ model: { ...model, variant: "low" } }, "model-mismatch"],
     [{ context: undefined }, "context-unavailable"],
     [{ context: [{ type: "assistant", time: { created: 1 }, content: [] }] }, "incomplete-assistant"],
     [{ context: [{ type: "assistant", time: { completed: 1 } }, { type: "assistant", time: {} }] }, "incomplete-assistant"],
     [{ step: undefined }, "no-recent-step"],
-    [{ step: { ...base.step!, model: "p/other" } }, "step-model-mismatch"],
+    [{ step: { ...base.step!, model: "p/other#high" } }, "model-mismatch"],
     [{ step: { ...base.step!, startedAt: base.now - 270_000 } }, "cache-expired"],
     [{ step: { ...base.step!, tokens: { ...base.step!.tokens, cache: { read: 0, write: 0 } } } }, "cache-cold"],
     [{ limits: undefined }, "unknown-model-window"],
@@ -550,8 +549,8 @@ test("the cache tracker uses the latest ended step and clears coverage on compac
   const end = (sessionID: string, read = 10) => handle({ type: "session.step.ended", data: { sessionID, tokens: { input: 1, output: 2, reasoning: 3, cache: { read, write: 0 } } } });
   const before = Date.now();
   start("one"); start("two", "other"); end("one"); end("two");
-  assert.equal(tracker.get("one")?.model, "p/m");
-  assert.equal(tracker.get("two")?.model, "p/other");
+  assert.equal(tracker.get("one")?.model, "p/m#");
+  assert.equal(tracker.get("two")?.model, "p/other#");
   assert.ok(tracker.get("one")!.startedAt >= before && tracker.get("one")!.startedAt <= Date.now());
   end("one", 0);
   assert.equal(tracker.get("one")?.tokens.cache.read, 0, "a newer cold step replaces the old warm one");

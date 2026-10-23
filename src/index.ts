@@ -107,7 +107,6 @@ export default {
         const plan = cacheReusePlan({
           enabled: cacheReuse,
           model: event.model,
-          sessionModel: session.model,
           context,
           step: cache.get(event.sessionID),
           limits: modelLimits,
