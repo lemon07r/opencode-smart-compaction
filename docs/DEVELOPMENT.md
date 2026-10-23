@@ -40,7 +40,11 @@ OpenCode logs each `session.generate` call's usage at `~/.local/share/opencode/l
 grep 'message="session generation usage diagnostic"' ~/.local/share/opencode/log/opencode.log | tail -n 10
 ```
 
-Matching calls should report substantial `cacheReadInputTokens`; `cacheWriteInputTokens` shows newly cached input. A warm previous step does not guarantee a matching prefix: plugins that modify `context` should mirror those changes in `generate`. Repeat with `cacheReuse: false` to confirm mode `stateless` and `cacheSkipped: "disabled"`, then restore the option. No live verification is implied by the unit tests.
+Matching calls should report substantial `cacheReadInputTokens`; `cacheWriteInputTokens` shows newly cached input. A warm previous step does not guarantee a matching prefix: plugins that modify `context` should mirror those changes in `generate`. Repeat with `cacheReuse: false` to confirm mode `stateless` and `cacheSkipped: "disabled"`, then restore the option.
+
+The plugin's own `checkpoint:` info line and fallback warnings go to the OpenCode server's stderr, not to `opencode.log`.
+
+To test without touching your real sessions, run a second server on another port with its own `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME`. Copy in `auth.json`, the provider config, and any local plugins your provider depends on, then drive it through `opencode api` or the HTTP API (`POST /api/session`, `/api/session/<id>/prompt`, `/api/session/<id>/compact`).
 
 ## Releases
 
