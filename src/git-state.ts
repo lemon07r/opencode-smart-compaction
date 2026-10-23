@@ -69,7 +69,7 @@ function truncatePatch(text: string, files: DirtyFileState[]): string {
   const inventory = files.map((file) => `${file.status} ${file.path}`).join("\n");
   const inventoryBlock = `## Changed-file inventory\n${inventory}\n`;
   if (inventoryBlock.length >= DIRTY_PATCH_CHARS) {
-    const marker = "\n[Inventory truncated; the complete path list remains in <uncommitted-dirty-files>.]";
+    const marker = "\n[Inventory truncated; see git status for the complete path list.]";
     return `${inventoryBlock.slice(0, DIRTY_PATCH_CHARS - marker.length)}${marker}`;
   }
   if (text.length + inventoryBlock.length <= DIRTY_PATCH_CHARS) return `${inventoryBlock}\n${text}`;
@@ -106,6 +106,16 @@ async function runGit(cwd: string, args: string[], signal?: AbortSignal): Promis
     signal,
   });
   return result.stdout;
+}
+
+async function readTrackedPatch(root: string, args: string[], signal?: AbortSignal): Promise<string> {
+  try {
+    return await runGit(root, args, signal);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    const tooLarge = error instanceof Error && "code" in error && error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+    return `[Patch bodies omitted: ${tooLarge ? `git output exceeded ${GIT_OUTPUT_LIMIT} bytes` : "git diff unavailable"}.]`;
+  }
 }
 
 async function readUntrackedPreviews(
@@ -184,8 +194,8 @@ export async function getGitEngineeringState(cwd?: string, signal?: AbortSignal)
       unstagedArgs.push("--", ":(exclude,top)**");
     }
     const [staged, unstaged, untracked] = await Promise.all([
-      runGit(root, stagedArgs, signal),
-      runGit(root, unstagedArgs, signal),
+      readTrackedPatch(root, stagedArgs, signal),
+      readTrackedPatch(root, unstagedArgs, signal),
       readUntrackedPreviews(root, codeFiles, signal),
     ]);
     const sections = [

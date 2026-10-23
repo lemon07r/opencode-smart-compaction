@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode/plugin";
+import { UNVERIFIED_SUBAGENTS_NOTE } from "./prompt.ts";
 import { appendedList } from "./session.ts";
 
 export type ContextMessage = Awaited<ReturnType<Plugin.Context["session"]["context"]>>[number];
@@ -13,6 +14,8 @@ export const RUNNING_SUBAGENTS_TAG = "running-subagents";
 
 const CARRIED_ID = /^(ses_[^\s():]+)/;
 const CARRIED_LINE = /^ses_[^\s():]+(?: \(([^()]*)\))?(?:: (.*))?$/;
+// OpenCode renders foreground and synthetic completion reports with this opening tag.
+const COMPLETION = /<subagent sessionID="(ses_[^"\s]+)" state="(?:completed|error|cancelled)"(?:\s|>)/g;
 
 const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
 const oneLine = (value: string) => value.replace(/\s+/g, " ").trim();
@@ -34,15 +37,31 @@ export function carriedSubagents(previousSummary: string | undefined): RunningSu
   });
 }
 
+/** A successful scan's carried list supersedes older completion reports preserved in checkpoint text. */
+export function carriedSubagentsVerified(previousSummary: string | undefined): boolean {
+  return appendedList(previousSummary, RUNNING_SUBAGENTS_TAG)[0] !== UNVERIFIED_SUBAGENTS_NOTE;
+}
+
 /**
  * Background subagents that have not reported back, from the session's active context (every stored message since
  * the last compaction, including the turns OpenCode keeps verbatim). The `subagent` tool returns at once with
  * `metadata.status` "running" when it backgrounds a child session, and OpenCode later delivers a synthetic message
  * with `metadata.source` "subagent" and the child's ID when that session completes, fails, or is cancelled.
- * A foreground result with `metadata.status` "completed" also ends a carried or running entry.
+ * A foreground result with `metadata.status` "completed" also ends a carried or running entry. Rendered completion
+ * tags in checkpoints and their recent context reconcile only unverified carried IDs when original records are gone.
  */
-export function runningSubagents(messages: readonly ContextMessage[], carried: readonly RunningSubagent[] = []): RunningSubagent[] {
+export function runningSubagents(
+  messages: readonly ContextMessage[],
+  carried: readonly RunningSubagent[] = [],
+  checkpointTexts: readonly string[] = [],
+  carriedVerified = true,
+): RunningSubagent[] {
   const running = new Map(carried.map((subagent) => [subagent.sessionID, subagent]));
+  const forgetReports = (value: string) => {
+    for (const match of value.matchAll(COMPLETION)) running.delete(match[1]!);
+  };
+  // A verified checkpoint is authoritative; older reports may predate a resumed child.
+  if (!carriedVerified) for (const value of checkpointTexts) forgetReports(value);
   for (const message of messages) {
     if (message.type === "assistant") {
       for (const part of message.content) {
@@ -58,9 +77,13 @@ export function runningSubagents(messages: readonly ContextMessage[], carried: r
         running.delete(sessionID);
         running.set(sessionID, { sessionID, agent: text(input.agent), description: text(input.description) });
       }
-    } else if (message.type === "synthetic" && message.metadata?.source === "subagent") {
-      const childID = text(message.metadata.childID);
+    } else if (message.type === "synthetic") {
+      const childID = message.metadata?.source === "subagent" && text(message.metadata.childID);
       if (childID) running.delete(childID);
+      forgetReports(message.text);
+    } else if (!carriedVerified && message.type === "compaction" && message.status === "completed") {
+      forgetReports(message.summary);
+      forgetReports(message.recent);
     }
   }
   return [...running.values()];

@@ -21,17 +21,38 @@ import type { SessionFacts } from "./session.ts";
 export const RETAINED_IDENTIFIERS_HEADING = "### Retained Identifiers";
 
 const REQUIRED_SECTIONS = [
-  /## 1\.\s+Primary Goal/i,
-  /## 2\.\s+Progress Ledger/i,
-  /## 3\.\s+Code Changes/i,
-  /## 4\.\s+Errors/i,
-  /## 5\.\s+Key Decisions/i,
-  /## 6\.\s+Resume Anchor/i,
+  /^ {0,3}#{2,4}[ \t]+1\.[ \t]+Primary Goal\b/i,
+  /^ {0,3}#{2,4}[ \t]+2\.[ \t]+Progress Ledger\b/i,
+  /^ {0,3}#{2,4}[ \t]+3\.[ \t]+Code Changes\b/i,
+  /^ {0,3}#{2,4}[ \t]+4\.[ \t]+Errors\b/i,
+  /^ {0,3}#{2,4}[ \t]+5\.[ \t]+Key Decisions\b/i,
+  /^ {0,3}#{2,4}[ \t]+6\.[ \t]+Resume Anchor\b/i,
 ];
 
-/** Whether a summary has all six numbered sections; a reply cut off by an output limit usually does not. */
+/** All six ordered headings must be outside code fences, with content after the resume heading. */
 export function isCompleteSummary(text: string): boolean {
-  return REQUIRED_SECTIONS.every((section) => section.test(text));
+  let section = 0;
+  let resumeContent = false;
+  let fence: string | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    // CommonMark forbids backticks in a backtick fence's info string.
+    if (marker && !(marker[1]![0] === "`" && marker[2]!.includes("`"))) {
+      if (!fence) fence = marker[1];
+      else if (marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = undefined;
+      continue;
+    }
+    if (!fence) {
+      const heading = REQUIRED_SECTIONS.findIndex((pattern) => pattern.test(line));
+      if (heading !== -1) {
+        if (heading !== section) return false;
+        section++;
+        continue;
+      }
+    }
+    if (section === REQUIRED_SECTIONS.length && line.trim()) resumeContent = true;
+  }
+  return section === REQUIRED_SECTIONS.length && resumeContent;
 }
 
 const CONVERSATION_OPEN = "<conversation>";
@@ -55,6 +76,7 @@ export interface Checkpoint {
 export interface CheckpointState {
   backgroundProcesses?: string[];
   runningSubagents?: string[];
+  subagentsVerified?: boolean;
   /** The summary also covers the turns OpenCode keeps verbatim, so the recent context may be shortened in requests. */
   recentSummarized?: boolean;
 }
@@ -62,7 +84,7 @@ export interface CheckpointState {
 export function buildCheckpoint(
   facts: SessionFacts,
   git: GitEngineeringState,
-  { backgroundProcesses = [], runningSubagents = [], recentSummarized = false }: CheckpointState = {},
+  { backgroundProcesses = [], runningSubagents = [], subagentsVerified = true, recentSummarized = false }: CheckpointState = {},
 ): Checkpoint {
   const previousSummary = facts.previousSummary ? semanticSummary(facts.previousSummary) : undefined;
   const protectedFacts = extractProtectedFacts(facts.userTexts, previousSummary);
@@ -88,6 +110,7 @@ export function buildCheckpoint(
     lockfilesAndGeneratedAssets: git.lockfilesAndGeneratedAssets,
     activeBackgroundProcesses: backgroundProcesses,
     runningSubagents,
+    subagentsVerified,
     recentSummarized,
   });
 

@@ -4,13 +4,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { buildCheckpoint, completeSummary, RETAINED_IDENTIFIERS_HEADING, semanticSummary } from "../src/checkpoint.ts";
+import { buildCheckpoint, completeSummary, isCompleteSummary, RETAINED_IDENTIFIERS_HEADING, semanticSummary } from "../src/checkpoint.ts";
 import { getGitEngineeringState } from "../src/git-state.ts";
 import { parseCheckpoint, readSessionFacts, summarizesRecent } from "../src/session.ts";
-import { formatFileOperationsXml } from "../src/prompt.ts";
-import { asTranscriptMessages, boundRecent, canSummarizeKept, keptMessages, RECENT_OMITTED_NOTE, trimRecentContext } from "../src/recent.ts";
-import { carriedSubagents, formatSubagent, runningSubagents } from "../src/subagents.ts";
+import { extractProtectedFacts, formatFileOperationsXml } from "../src/prompt.ts";
+import { adaptKeptMessages, boundRecent, keptMessages, RECENT_OMITTED_NOTE, trimRecentContext } from "../src/recent.ts";
+import { carriedSubagents, carriedSubagentsVerified, formatSubagent, runningSubagents } from "../src/subagents.ts";
 import plugin from "../src/index.ts";
+import { createThresholdWatcher } from "../src/threshold.ts";
 
 const SHA = "1234567890abcdef1234567890abcdef12345678";
 const noGit = { available: false, files: [], patch: "", lockfilesAndGeneratedAssets: [] };
@@ -140,6 +141,11 @@ test("the prompt carries the conversation, previous checkpoint, and protected fa
   const first = buildCheckpoint({ userTexts: ["start"], readFiles: [], modifiedFiles: [], transcript: "[User]: start" }, noGit);
   assert.ok(first.prompt.includes(`in the ${open("conversation")} tags above`));
   assert.ok(!first.prompt.includes(open("previous-summary")));
+  const unavailable = buildCheckpoint({
+    userTexts: [], readFiles: [], modifiedFiles: [], transcript: "[User]: Next",
+    previousSummary: `Keep https://goal.example.com\n\n<uncommitted-state-unavailable />\nhttps://state-only.example.com`,
+  }, noGit);
+  assert.deepEqual(unavailable.protectedFacts, ["https://goal.example.com"], "identifier extraction uses the caller's semantic summary");
 });
 
 test("a finished summary gets dropped identifiers back verbatim and the exact file state", () => {
@@ -149,6 +155,42 @@ test("a finished summary gets dropped identifiers back verbatim and the exact fi
   assert.ok(!done.includes("- kept"), "facts already present are not repeated");
   assert.equal(semanticSummary(done).includes(open(TOUCHED)), false);
   assert.equal(completeSummary(`has ${SHA}`, { protectedFacts: [SHA], appendix: "" }), `has ${SHA}`);
+});
+
+test("dirty-file and generated-asset appendices are bounded with explicit omission counts", () => {
+  const files = Array.from({ length: 75 }, (_, i) => `dist/file-${String(i).padStart(2, "0")}.js`);
+  const block = formatFileOperationsXml({ activeDirtyFiles: [...files].reverse(), lockfilesAndGeneratedAssets: files });
+  for (const tag of ["uncommitted-dirty-files", "modified-lockfiles-and-assets"]) {
+    assert.ok(block.includes(`${open(tag)}\n${files.slice(0, 60).join("\n")}\n… 15 more omitted\n${close(tag)}`));
+  }
+  assert.ok(!block.includes(files[60]!));
+  const exact = formatFileOperationsXml({ activeDirtyFiles: files.slice(0, 60), lockfilesAndGeneratedAssets: files.slice(0, 60) });
+  assert.ok(!exact.includes("omitted"), "a list that fits has no omission note");
+});
+
+test("protected URLs retain balanced parentheses through extraction and restoration", () => {
+  const url = "https://en.wikipedia.org/wiki/Function_(mathematics)";
+  const nested = "https://example.com/a_(b_(c))";
+  assert.deepEqual(extractProtectedFacts([`Read [function](${url}), (${url}). Also ${nested}!`]), [url, nested]);
+  assert.deepEqual(extractProtectedFacts(["See https://example.com/path)."]), ["https://example.com/path"]);
+  const checkpoint = buildCheckpoint({ userTexts: [`Read ${url}`], readFiles: [], modifiedFiles: [], transcript: "[User]: Read it" }, noGit);
+  assert.ok(completeSummary("Summary", checkpoint).includes(`- ${url}\n`));
+  const carried = buildCheckpoint({ userTexts: [], previousSummary: `Keep ${url}`, readFiles: [], modifiedFiles: [], transcript: "[User]: Next" }, noGit);
+  assert.deepEqual(carried.protectedFacts, [url]);
+});
+
+test("protected URLs stop at unmatched markdown closers before emphasis", () => {
+  const wikipedia = "https://en.wikipedia.org/wiki/Function_(mathematics)";
+  for (const [source, expected] of [
+    ["**[docs](https://example.com)**", "https://example.com"],
+    ["[x](https://a.b/c)", "https://a.b/c"],
+    [wikipedia, wikipedia],
+    [`See ${wikipedia}).`, wikipedia],
+  ]) {
+    assert.deepEqual(extractProtectedFacts([source!]), [expected]);
+    const checkpoint = buildCheckpoint({ userTexts: [source!], readFiles: [], modifiedFiles: [], transcript: "[User]: Read the docs" }, noGit);
+    assert.ok(completeSummary("Summary", checkpoint).includes(`- ${expected}\n`), "restoration keeps only the exact URL");
+  }
 });
 
 test("git state covers tracked diffs and bounded untracked previews, never following symlinks", async () => {
@@ -178,6 +220,31 @@ test("git state covers tracked diffs and bounded untracked previews, never follo
   assert.equal((await getGitEngineeringState(os.tmpdir())).available, false);
 });
 
+test("an oversized tracked diff keeps the status inventory and generated-file list", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "osc-large-diff-"));
+  try {
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "ignore" });
+    git("init", "-q");
+    fs.writeFileSync(path.join(root, "large.ts"), "before\n");
+    fs.writeFileSync(path.join(root, "bun.lock"), "before\n");
+    git("add", ".");
+    git("-c", "user.email=t@example.com", "-c", "user.name=Test", "commit", "-qm", "init");
+    fs.writeFileSync(path.join(root, "large.ts"), "export const large = true;\n".repeat(100_000));
+    fs.writeFileSync(path.join(root, "bun.lock"), "after\n");
+    fs.writeFileSync(path.join(root, "fresh.ts"), "export const fresh = true;\n");
+    assert.throws(() => execFileSync("git", ["diff", "--", "large.ts"], { cwd: root, maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }), /ENOBUFS/, "the fixture actually exceeds the git output limit");
+    const state = await getGitEngineeringState(root);
+    assert.equal(state.available, true);
+    assert.deepEqual(state.files.map((file) => file.path).sort(), ["bun.lock", "fresh.ts", "large.ts"]);
+    assert.deepEqual(state.lockfilesAndGeneratedAssets, ["bun.lock"]);
+    assert.match(state.patch, /Patch.*(?:unavailable|omitted).*output/i);
+    assert.ok(state.patch.includes("export const fresh = true"), "a failed tracked diff does not discard untracked previews");
+    assert.ok(state.patch.length <= 16_000, "the failure notice and patch stay bounded");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 const launch = (sessionID: string, agent: string, description: string, status = "running") => ({
   type: "assistant",
   content: [
@@ -197,6 +264,8 @@ const reported = (childID: string, state = "completed") => ({
 test("running subagents are background launches that have not reported back, carried across compactions", () => {
   const previous = `summary\n\n${open("running-subagents")}\nBackground subagents still running.\nses_old (general): Mine the logs\nses_early: Earlier job\n${close("running-subagents")}`;
   const carried = carriedSubagents(previous);
+  assert.equal(carriedSubagentsVerified(previous), true);
+  assert.equal(carriedSubagentsVerified(undefined), true);
   assert.deepEqual(carried, [
     { sessionID: "ses_old", agent: "general", description: "Mine the logs" },
     { sessionID: "ses_early", agent: undefined, description: "Earlier job" },
@@ -219,6 +288,9 @@ test("running subagents are background launches that have not reported back, car
   );
   const awkward = { sessionID: "ses_x1", agent: "worker (fast)", description: "Fix <a> & b\nses_phantom (x): no" };
   const block = formatFileOperationsXml({ runningSubagents: [formatSubagent(awkward)] });
+  assert.equal(carriedSubagentsVerified(`summary${block}`), true);
+  const unverified = formatFileOperationsXml({ runningSubagents: [formatSubagent(awkward)], subagentsVerified: false });
+  assert.equal(carriedSubagentsVerified(`summary${unverified}`), false);
   assert.deepEqual(carriedSubagents(`summary${block}`), [
     { sessionID: "ses_x1", agent: "worker fast", description: "Fix <a> & b ses_phantom (x): no" },
   ], "labels survive the appendix round trip as one line each");
@@ -238,6 +310,25 @@ test("completed foreground results remove carried and running subagents", () => 
   ] as never, carried), [{ sessionID: "ses_untouched", agent: "worker", description: "Keep running" }]);
 });
 
+test("rendered checkpoint completion reports reconcile only unverified carried IDs", () => {
+  const carried = [{ sessionID: "ses_carried", agent: "worker", description: "Earlier work" }];
+  for (const state of ["completed", "error", "cancelled"]) {
+    const report = reported("ses_carried", state).text;
+    assert.deepEqual(runningSubagents([], carried, [`Checkpoint\n${report}`], false), []);
+    assert.deepEqual(runningSubagents([], carried, [`Checkpoint\n${report}`], true), carried);
+    for (const field of ["summary", "recent"]) {
+      const checkpoint = [{ type: "compaction", status: "completed", summary: "", recent: "", [field]: report }];
+      assert.deepEqual(runningSubagents(checkpoint as never, carried, [], false), []);
+      assert.deepEqual(runningSubagents(checkpoint as never, carried, [], true), carried);
+    }
+    assert.deepEqual(runningSubagents([{ type: "synthetic", text: report }] as never, carried), [], "newer synthetic text still ends a verified carried entry");
+    assert.deepEqual(runningSubagents([launch("ses_carried", "worker", "Resumed")] as never, carried, [report], false), [
+      { sessionID: "ses_carried", agent: "worker", description: "Resumed" },
+    ], "a newer launch can resume a child after its older report");
+  }
+  assert.deepEqual(runningSubagents([], carried, ['<subagent sessionID="ses_carried" state="running">'], false), carried);
+});
+
 type CompactionHook = (event: Record<string, unknown>) => Promise<void>;
 type Generate = (input: { prompt: string; model: unknown }) => Promise<{ text: string }>;
 
@@ -247,10 +338,60 @@ const SIX_SECTIONS = [
   "## 3. Code Changes & In-Progress Snippets",
   "## 4. Errors, Root Causes & Fixes",
   "## 5. Key Decisions & Hypotheses",
-  "## 6. Resume Anchor & Immediate Next Action",
+  "## 6. Resume Anchor & Immediate Next Action\nContinue the release.",
 ].join("\n");
 
-async function loadHooks(generate: Generate, events: unknown[] = [], context: unknown[] | Error = [], options: Record<string, unknown> = {}) {
+test("summary validation requires ordered line headings outside fences and a resume body", () => {
+  assert.equal(isCompleteSummary(SIX_SECTIONS), true);
+  assert.equal(isCompleteSummary(SIX_SECTIONS.replace("\nContinue the release.", "")), false, "a cut-off resume heading is incomplete");
+  assert.equal(isCompleteSummary(`${SIX_SECTIONS.replace("\nContinue the release.", "")}\n \t\n`), false);
+  for (const fence of ["```", "~~~~"]) {
+    assert.equal(isCompleteSummary(`${fence}markdown\n${SIX_SECTIONS}\n${fence}`), false, "headings in fenced code are not sections");
+    assert.equal(isCompleteSummary(`${fence}markdown\n## 6. Resume Anchor\n${fence}\n${SIX_SECTIONS}`), true, "an example before real headings is ignored");
+  }
+  assert.equal(isCompleteSummary(SIX_SECTIONS.replace(/^## /gm, "inline ## ")), false, "headings are line anchored");
+  assert.equal(isCompleteSummary(SIX_SECTIONS.replace("## 2. Progress Ledger", "## 4. Errors").replace("## 4. Errors, Root Causes & Fixes", "## 2. Progress Ledger")), false, "sections must be in order");
+});
+
+test("summary validation ignores inline triple-backtick lines as fence openers", () => {
+  assert.equal(isCompleteSummary(`\`\`\`const x = 1\`\`\`\n${SIX_SECTIONS}`), true);
+});
+
+test("summary validation accepts heading levels two through four with up to three spaces", () => {
+  for (const hashes of ["##", "###", "####"]) {
+    for (const indent of ["", " ", "  ", "   "]) {
+      assert.equal(isCompleteSummary(SIX_SECTIONS.replace(/^## /gm, `${indent}${hashes}\t`)), true);
+    }
+  }
+});
+
+test("threshold checks discard token usage when compaction changes during a model lookup", async () => {
+  for (const outcome of ["started", "ended", "failed"] as const) {
+    let resolve!: (value: { data: unknown[] }) => void;
+    const promise = new Promise<{ data: unknown[] }>((done) => { resolve = done; });
+    const compacted: string[] = [];
+    const warnings: string[] = [];
+    const handle = createThresholdWatcher({
+      model: { list: () => promise },
+      session: { compact: async ({ sessionID }: { sessionID: string }) => { compacted.push(sessionID); } },
+    } as never, { mode: "percent", percent: 95, hardLimitTokens: 600_000 }, (warning) => warnings.push(warning));
+    const tokens = { input: 99, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+    handle({ type: "session.step.started", data: { sessionID: "ses_race", model: { providerID: "p", id: "m" } } } as never);
+    handle({ type: "session.step.ended", data: { sessionID: "ses_race", tokens } } as never);
+    handle({ type: "session.compaction.started", data: { sessionID: "ses_race" } } as never);
+    if (outcome !== "started") handle({ type: `session.compaction.${outcome}`, data: { sessionID: "ses_race" } } as never);
+    resolve({ data: [{ providerID: "p", id: "m", limit: { input: 100, context: 100 } }] });
+    await new Promise((done) => setImmediate(done));
+    assert.deepEqual(compacted, [], `a compaction that ${outcome} invalidates the old step`);
+    assert.deepEqual(warnings, []);
+    if (outcome === "started") handle({ type: "session.compaction.ended", data: { sessionID: "ses_race" } } as never);
+    handle({ type: "session.step.ended", data: { sessionID: "ses_race", tokens } } as never);
+    await new Promise((done) => setImmediate(done));
+    assert.deepEqual(compacted, outcome === "failed" ? [] : ["ses_race"], "fresh steps still compact unless the last compaction failed");
+  }
+});
+
+async function loadHooks(generate: Generate, events: unknown[] = [], context: unknown[] | Error | (() => unknown[]) = [], options: Record<string, unknown> = {}) {
   const hooks = new Map<string, CompactionHook>();
   const ctx = {
     location: { directory: os.tmpdir() },
@@ -268,7 +409,7 @@ async function loadHooks(generate: Generate, events: unknown[] = [], context: un
       get: async () => ({ location: { directory: os.tmpdir() }, model: { providerID: "cliproxy", id: "factory/claude-sonnet-5-5" } }),
       context: async () => {
         if (context instanceof Error) throw context;
-        return context;
+        return typeof context === "function" ? context() : context;
       },
     },
     generate: { text: generate },
@@ -391,13 +532,14 @@ test("the turns OpenCode keeps verbatim are found by ID and read like the summar
   assert.deepEqual(kept?.map((message) => message.id), ["m3", "m4", "m5"]);
   assert.equal(keptMessages([user("no ids")] as unknown as Messages, stored as never), undefined, "no match means no coverage");
 
-  const facts = readSessionFacts([...summarizedMessages, ...asTranscriptMessages(kept!)]);
+  const adapted = adaptKeptMessages(kept!);
+  const facts = readSessionFacts([...summarizedMessages, ...adapted.messages]);
   assert.ok(facts.userTexts.includes("Now deploy to https://kept.example.com"), "kept user words are protected");
   assert.ok(!facts.userTexts.includes("background job finished"), "synthetic text is not user-authored");
   assert.deepEqual(facts.modifiedFiles, ["/repo/kept.ts"], "failed calls in kept turns don't count");
   assert.match(facts.transcript, /\[Tool error: write\]: denied/);
   assert.match(facts.transcript, /\[Assistant\]: Done\.\n\n\[Tool result: edit\]: ok\n\n\[Tool error: write\]: denied\n\n\[Assistant\]: \[Synthetic context\] \(source: subagent\): background job finished$/);
-  assert.ok(canSummarizeKept(kept!));
+  assert.ok(adapted.complete);
 
   const covered = readSessionFacts([checkpointMessage(summarized("old"), "[User]: Keep 10.0.0.9\n[Assistant tool call]: read({\"path\":\"/repo/r.ts\"})\n[Tool result]: x"), user("next")] as unknown as Messages);
   assert.equal(covered.transcript, "[User]: next", "a recent context the previous summary covered is not summarized again");
@@ -544,8 +686,9 @@ test("skill, system, synthetic, and shell history reach the prompt without becom
     { id: "idle", type: "idle", outcome: "succeeded" },
     { id: "user", type: "user", text: "Only these are user words", files: [], agents: [], skills: [] },
   ];
-  assert.ok(canSummarizeKept(tail as never));
-  const transcriptMessages = asTranscriptMessages(tail as never);
+  const adapted = adaptKeptMessages(tail as never);
+  assert.ok(adapted.complete);
+  const transcriptMessages = adapted.messages;
   const facts = readSessionFacts(transcriptMessages);
   assert.deepEqual(facts.userTexts, ["Only these are user words"]);
   assert.match(facts.transcript, /\[Assistant\]: \[Historical skill context: Deploy \(skills\/deploy\)\]: Skill instructions/);
@@ -592,11 +735,12 @@ test("unsupported stored content and attachments withhold the kept-tail marker",
     { type: "user", text: "skill attachment", skills: [{ id: "skills/deploy", name: "Deploy", text: "inline skill" }] },
     { type: "assistant", content: [{ type: "text", text: "partial assistant" }, { type: "tool", id: "stream", name: "shell", state: { status: "streaming", input: "{\"command\":" } }] },
     { type: "assistant", content: [{ type: "future-part", text: "unrecognized part" }] },
+    { type: "assistant", content: [{ type: "tool", id: "future", name: "shell", state: { status: "future-status", input: {} } }] },
     { type: "assistant", content: [{ type: "tool", id: "file", name: "read", state: { status: "completed", input: {}, content: [{ type: "file", uri: "file:///repo/picture.png", mime: "image/png" }] } }] },
     { type: "assistant", content: [{ type: "tool", id: "file_error", name: "read", state: { status: "error", input: {}, error: { message: "failed" }, content: [{ type: "file", uri: "file:///repo/picture.png", mime: "image/png" }] } }] },
   ];
   for (const [index, message] of unsupported.entries()) {
-    assert.equal(canSummarizeKept([message] as never), false, `unsupported fixture ${index} is not covered`);
+    assert.equal(adaptKeptMessages([message] as never).complete, false, `unsupported fixture ${index} is not covered`);
     let prompt = "";
     const hooks = await loadHooks(async (input) => {
       prompt = input.prompt;
@@ -617,7 +761,7 @@ test("unsupported stored content and attachments withhold the kept-tail marker",
     await hooks.get("context")!(contextEvent);
     assert.equal(contextEvent.messages[0], original, "unsupported tails are left whole");
   }
-  assert.ok(canSummarizeKept([]), "an empty matched tail has no unsupported content");
+  assert.deepEqual(adaptKeptMessages([]), { messages: [], complete: true }, "an empty matched tail has no unsupported content");
 });
 
 test("compaction lifecycle records do not prevent safe coverage of the kept conversation", async () => {
@@ -626,13 +770,14 @@ test("compaction lifecycle records do not prevent safe coverage of the kept conv
     { id: "kept", type: "user", text: "Keep working on the release" },
     { id: "pending", type: "compaction", status: "running", reason: "manual", summary: "", recent: "" },
   ];
-  assert.ok(canSummarizeKept(tail as never));
-  const facts = readSessionFacts(asTranscriptMessages(tail as never));
+  const adapted = adaptKeptMessages(tail as never);
+  assert.ok(adapted.complete);
+  const facts = readSessionFacts(adapted.messages);
   assert.deepEqual(facts.userTexts, ["Keep working on the release"]);
   assert.match(facts.transcript, /Historical compaction failure.*No older conversation to summarize/);
   assert.doesNotMatch(facts.transcript, /pending|running/, "the current empty placeholder is not a task to resume");
-  assert.equal(canSummarizeKept([{ ...tail[2], summary: "uncovered summary" }] as never), false);
-  assert.equal(canSummarizeKept([{ ...tail[2], recent: "uncovered recent turns" }] as never), false);
+  assert.equal(adaptKeptMessages([{ ...tail[2], summary: "uncovered summary" }] as never).complete, false);
+  assert.equal(adaptKeptMessages([{ ...tail[2], recent: "uncovered recent turns" }] as never).complete, false);
 
   let prompt = "";
   const hooks = await loadHooks(async (input) => {
@@ -663,14 +808,57 @@ test("a context-read failure retains carried subagents and never marks or trims 
     await hooks.get("compaction")!(event);
     assert.equal(attempts, 1, "the plugin generates rather than handing off to a built-in summary");
     assert.ok(event.result?.summary.includes("\nses_carried (worker): Preserve this child\n"));
+    assert.match(event.result?.summary ?? "", /unverified/i, "a failed scan cannot assert a carried child is still running");
     assert.ok(!summarizesRecent(event.result?.summary));
     const original = checkpointMessage(event.result!.summary, `[User]: ${"x".repeat(1_000)}`);
     const contextEvent = { messages: [original] };
     await hooks.get("context")!(contextEvent);
     assert.equal(contextEvent.messages[0], original, "a context-read failure leaves the recent block untrimmed");
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!, /new subagent launches unavailable, previously recorded children retained, recent context left untrimmed: Error: context offline/);
+    assert.match(warnings[0]!, /new subagent launches unavailable, previously recorded children unverified, recent context left untrimmed: Error: context offline/);
   } finally {
     console.warn = originalWarn;
   }
+});
+
+test("verified checkpoints keep resumed subagents despite older rendered completion reports", async () => {
+  const report = reported("ses_resumed");
+  let context: unknown[] = [launch("ses_resumed", "worker", "Original work"), report, launch("ses_resumed", "worker", "Follow-up work")];
+  const hooks = await loadHooks(async () => ({ text: `${SIX_SECTIONS}\n${report.text}` }), [], () => context);
+  const first = compactionEvent();
+  await hooks.get("compaction")!(first);
+  assert.ok(first.result);
+  assert.deepEqual(carriedSubagents(first.result.summary), [{ sessionID: "ses_resumed", agent: "worker", description: "Follow-up work" }]);
+  assert.doesNotMatch(first.result.summary, /unverified/);
+
+  context = [{ id: "checkpoint", type: "compaction", status: "completed", summary: first.result.summary, recent: report.text }];
+  const second = compactionEvent();
+  second.messages = [checkpointMessage(first.result.summary, report.text), user("Continue the follow-up")] as never;
+  await hooks.get("compaction")!(second);
+  assert.ok(second.result);
+  assert.deepEqual(carriedSubagents(second.result.summary), [{ sessionID: "ses_resumed", agent: "worker", description: "Follow-up work" }], "the verified carried list supersedes old reports in the summary and recent context");
+});
+
+test("subagent tracking recovers after a failed scan and completion records move into a checkpoint", async () => {
+  let context: unknown[] | undefined;
+  const hooks = await loadHooks(async () => ({ text: SIX_SECTIONS }), [], () => {
+    if (!context) throw new Error("context temporarily offline");
+    return context;
+  });
+  const previous = `${summarized(SIX_SECTIONS)}${formatFileOperationsXml({ runningSubagents: ["ses_carried (worker): Earlier work", "ses_active (reviewer): Still working", "ses_early (worker): Already reported"], subagentsVerified: false })}`;
+  const first = compactionEvent();
+  first.messages = [checkpointMessage(previous, `[Synthetic context]: ${reported("ses_early").text}`), user("Continue")] as never;
+  await hooks.get("compaction")!(first);
+  assert.ok(first.result);
+  assert.match(first.result.summary, /unverified/);
+  assert.deepEqual(carriedSubagents(first.result.summary).map((child) => child.sessionID), ["ses_carried", "ses_active"], "a report in covered recent context is reconciled even while the context read fails");
+
+  const recent = `[Synthetic context]: ${reported("ses_carried").text}`;
+  context = [{ id: "checkpoint", type: "compaction", status: "completed", summary: first.result.summary, recent }];
+  const recovered = compactionEvent();
+  recovered.messages = [checkpointMessage(first.result.summary, recent), user("Continue again")] as never;
+  await hooks.get("compaction")!(recovered);
+  assert.ok(recovered.result);
+  assert.deepEqual(carriedSubagents(recovered.result.summary).map((child) => child.sessionID), ["ses_active"], "the original synthetic completion is no longer in the active context");
+  assert.doesNotMatch(recovered.result.summary, /unverified/);
 });
